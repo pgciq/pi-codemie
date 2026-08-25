@@ -540,8 +540,14 @@ export default async function (pi) {
           // (Bearer JWTs get a 302 to the SSO login). The `!command` value is
           // re-executed per request, so it always reflects the latest session
           // written to COOKIE_FILE by login/refresh.
+          // Windows shells have no `cat` — use cmd's built-in `type` there.
           oauth: oauthBlock,
-          headers: { Cookie: `!cat ${COOKIE_FILE}` },
+          headers: {
+            Cookie:
+              process.platform === "win32"
+                ? `!type "${COOKIE_FILE}"`
+                : `!cat "${COOKIE_FILE}"`,
+          },
         }
       : undefined;
 
