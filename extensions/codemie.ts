@@ -42,6 +42,11 @@ function ensureApiBase(rawUrl) {
     : `${base}/code-assistant-api`;
 }
 
+/** Inverse of ensureApiBase: recover the frontend URL from an API base. */
+function frontendFromApiBase(apiBase) {
+  return apiBase.replace(/\/+$/, "").replace(/\/code-assistant-api\/?$/i, "");
+}
+
 // ---------------------------------------------------------------------------
 // Model metadata (mirrors codemie-code's src/agents/plugins/pi/pi.models.ts)
 // ---------------------------------------------------------------------------
@@ -434,31 +439,56 @@ export default async function (pi) {
 
   if (!envAuth) {
 
-    const makeOauthBlock = () => ({
-      name: "CodeMie (SSO)",
-      async login(callbacks) {
-        const cred = await performLogin(codeMieUrl, (info) =>
-          callbacks.onAuth(info)
-        );
-        persistSession(cred);
-        apiUrl = cred.apiUrl;
-        oauthCreds = cred;
-        return { refresh: cred.refresh, access: cred.access, expires: cred.expires };
-      },
-      async refreshToken(credentials) {
-        // Still valid? Keep it (prevents redundant browser pop-ups).
-        if (!isExpired(credentials)) return credentials;
-        console.error("[codemie] SSO session expired — reopening browser for login...");
-        const cred = await performLogin(codeMieUrl);
-        persistSession(cred);
-        apiUrl = cred.apiUrl;
-        oauthCreds = cred;
-        return { refresh: cred.refresh, access: cred.access, expires: cred.expires };
-      },
-      getApiKey(credentials) {
-        return credentials.access;
-      },
-    });
+    // Base URL used by login/refresh. Defaults to CODEMIE_BASE_URL or the
+    // public instance; /login lets the user override it interactively.
+    let activeBaseUrl = codeMieUrl;
+
+    const makeOauthBlock = () => {
+      // Ask which CodeMie instance to log into. Pressing Enter accepts the
+      // default — same UX as the built-in provider logins.
+      const resolveBaseUrl = async (callbacks) => {
+        if (!process.env.CODEMIE_BASE_URL && callbacks?.onPrompt) {
+          try {
+            const answer = await callbacks.onPrompt({
+              message: `CodeMie URL (Enter = ${DEFAULT_CODEMIE_URL}):`,
+            });
+            const trimmed = typeof answer === "string" ? answer.trim() : "";
+            if (trimmed) return ensureApiBase(trimmed);
+          } catch {
+            // Prompt unavailable/cancelled — fall back to the default.
+          }
+        }
+        return activeBaseUrl;
+      };
+
+      return {
+        name: "CodeMie (SSO)",
+        async login(callbacks) {
+          const baseUrl = await resolveBaseUrl(callbacks);
+          activeBaseUrl = baseUrl;
+          const cred = await performLogin(baseUrl, (info) =>
+            callbacks.onAuth(info)
+          );
+          persistSession(cred);
+          apiUrl = cred.apiUrl;
+          oauthCreds = cred;
+          return { refresh: cred.refresh, access: cred.access, expires: cred.expires };
+        },
+        async refreshToken(credentials) {
+          // Still valid? Keep it (prevents redundant browser pop-ups).
+          if (!isExpired(credentials)) return credentials;
+          console.error("[codemie] SSO session expired — reopening browser for login...");
+          const cred = await performLogin(activeBaseUrl);
+          persistSession(cred);
+          apiUrl = cred.apiUrl;
+          oauthCreds = cred;
+          return { refresh: cred.refresh, access: cred.access, expires: cred.expires };
+        },
+        getApiKey(credentials) {
+          return credentials.access;
+        },
+      };
+    };
     oauthBlock = makeOauthBlock();
 
     // Reuse whatever session is already stored — never open a browser at
@@ -467,7 +497,12 @@ export default async function (pi) {
     const stored = readStoredOauth();
     if (stored) {
       oauthCreds = stored;
-      if (stored.apiUrl) apiUrl = stored.apiUrl;
+      if (stored.apiUrl) {
+        apiUrl = stored.apiUrl;
+        // Refreshes after a restart must reopen the browser on the SAME
+        // instance the stored session belongs to.
+        activeBaseUrl = ensureApiBase(frontendFromApiBase(stored.apiUrl));
+      }
       persistSession(stored); // keep the cookie file in sync with auth.json
     }
 

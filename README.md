@@ -40,7 +40,9 @@ pi install /path/to/pi-codemie
 
 ### OAuth SSO login (recommended)
 
-No browser pop-up at startup. Login happens on first use or via `/login codemie`:
+No browser pop-up at startup. Login happens on first use or via `/login codemie`.
+When logging in you are prompted for the CodeMie instance URL — press **Enter**
+to accept the default (`https://codemie.lab.epam.com`) or type another URL:
 
 ```bash
 # Open browser for SSO login
