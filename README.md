@@ -32,7 +32,7 @@ pi install /path/to/pi-codemie
 
 | Variable | Description |
 |---|---|
-| `CODEMIE_BASE_URL` | CodeMie instance URL (e.g. `https://codemie.lab.epam.com`). Auto-normalizes to include `/code-assistant-api`. |
+| `CODEMIE_BASE_URL` | CodeMie instance URL. **Default:** `https://codemie.lab.epam.com`. Auto-normalizes to include `/code-assistant-api`. |
 | `CODEMIE_JWT_TOKEN` | JWT bearer token (CI mode). |
 | `CODEMIE_API_KEY` | API key bearer token (CI mode). |
 | `CODEMIE_COOKIE` | Raw session cookie (CI mode). |

@@ -26,6 +26,8 @@ const AUTH_FILE = join(homedir(), ".pi", "agent", "auth.json");
 const COOKIE_FILE = join(homedir(), ".pi", "agent", "codemie-cookie.txt");
 const PROVIDER_IDS = ["codemie"];
 const LOGIN_TIMEOUT_MS = 120_000;
+// Default CodeMie instance — override with CODEMIE_BASE_URL.
+const DEFAULT_CODEMIE_URL = "https://codemie.lab.epam.com";
 
 /**
  * Normalize a CodeMie URL to the API base, exactly like codemie-code's
@@ -387,10 +389,11 @@ async function fetchCodeMieModels(apiUrl, { bearer, cookieString }) {
 
 export default async function (pi) {
   // Accept either https://host or https://host/code-assistant-api — normalize
-  // to the API base like the CodeMie CLI does.
-  const codeMieUrl = process.env.CODEMIE_BASE_URL
-    ? ensureApiBase(process.env.CODEMIE_BASE_URL)
-    : "";
+  // to the API base like the CodeMie CLI does. Defaults to the public EPAM lab
+  // instance when CODEMIE_BASE_URL is not set.
+  const codeMieUrl = ensureApiBase(
+    process.env.CODEMIE_BASE_URL || DEFAULT_CODEMIE_URL
+  );
 
   // ---- Mode 1: explicit env-var auth (CI / service accounts) --------------
   const jwt = process.env.CODEMIE_JWT_TOKEN || "";
@@ -424,12 +427,6 @@ export default async function (pi) {
   let oauthCreds = null;
 
   if (!envAuth) {
-    if (!codeMieUrl) {
-      console.error(
-        "[codemie] Set CODEMIE_BASE_URL (or CODEMIE_JWT_TOKEN) to enable the CodeMie provider."
-      );
-      return;
-    }
 
     const makeOauthBlock = () => ({
       name: "CodeMie (SSO)",
