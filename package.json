@@ -9,6 +9,10 @@
     "llm-gateway"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pgciq/pi-codemie"
+  },
   "files": [
     "extensions",
     "README.md"
