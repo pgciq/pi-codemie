@@ -341,15 +341,19 @@ function cookieStringFromCredential(credential) {
 }
 
 /**
- * Persist the OAuth credentials AND dump the raw session cookie to a file.
+ * Persist the OAuth credentials AND export the raw session cookie.
  * The gateway authenticates API calls with the _oauth2_proxy session cookie —
- * a Bearer JWT is rejected (302 to the SSO login page) — and provider request
- * headers read this file via the `!command` config syntax, resolved per request.
+ * a Bearer JWT is rejected (302 to the SSO login page). We expose it to pi's
+ * provider config via an environment variable (`Cookie: $CODEMIE_SESSION_COOKIE`):
+ * unlike `!command` values, this needs no shell, which matters on Windows where
+ * neither `cat` nor cmd built-ins like `type` are reliably spawnable.
  */
 function persistSession(credential) {
   writeStoredOauth(credential);
   try {
-    writeFileSync(COOKIE_FILE, cookieStringFromCredential(credential), { mode: 0o600 });
+    const cookieString = cookieStringFromCredential(credential);
+    process.env.CODEMIE_SESSION_COOKIE = cookieString;
+    writeFileSync(COOKIE_FILE, cookieString, { mode: 0o600 });
     chmodSync(COOKIE_FILE, 0o600);
   } catch (error) {
     console.error(
@@ -537,17 +541,11 @@ export default async function (pi) {
     : oauthBlock
       ? {
           // The gateway authenticates with the _oauth2_proxy session cookie
-          // (Bearer JWTs get a 302 to the SSO login). The `!command` value is
-          // re-executed per request, so it always reflects the latest session
-          // written to COOKIE_FILE by login/refresh.
-          // Windows shells have no `cat` — use cmd's built-in `type` there.
+          // (Bearer JWTs get a 302 to the SSO login). persistSession() keeps
+          // this env var in sync on every login/refresh; env interpolation
+          // needs no shell, so it works identically on Windows and Unix.
           oauth: oauthBlock,
-          headers: {
-            Cookie:
-              process.platform === "win32"
-                ? `!type "${COOKIE_FILE}"`
-                : `!cat "${COOKIE_FILE}"`,
-          },
+          headers: { Cookie: "$CODEMIE_SESSION_COOKIE" },
         }
       : undefined;
 
