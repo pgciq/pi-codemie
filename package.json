@@ -1,8 +1,13 @@
 {
   "name": "pi-codemie",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Pi extension for CodeMie (AI/Run) enterprise gateway provider",
-  "keywords": ["pi-package", "codemie", "ai-run", "llm-gateway"],
+  "keywords": [
+    "pi-package",
+    "codemie",
+    "ai-run",
+    "llm-gateway"
+  ],
   "license": "MIT",
   "files": [
     "extensions",
@@ -16,6 +21,8 @@
     "typebox": "*"
   },
   "pi": {
-    "extensions": ["./extensions"]
+    "extensions": [
+      "./extensions"
+    ]
   }
 }
