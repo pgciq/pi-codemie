@@ -125,12 +125,14 @@ function convertLlmModel(model) {
     entry.reasoning = true;
     entry.thinkingLevelMap = {
       off: null,
-      minimal: "minimal",
+      // The CodeMie gateway only accepts low/medium/high/xhigh/max — there
+      // is no "minimal" variant (400 "unknown variant `minimal`").
+      minimal: "low",
       low: "low",
       medium: "medium",
       high: "high",
-      xhigh: "high",
-      max: "high",
+      xhigh: "xhigh",
+      max: "max",
     };
   }
 
