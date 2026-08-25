@@ -66,6 +66,18 @@ pi --model codemie/claude-sonnet-4-6 "你好"
 pi --model codemie/claude-opus-4-6 "你好"
 ```
 
+## Commands
+
+| Command | Description |
+|---|---|
+| `/codemie-prices [input\|output\|total\|context] [asc\|desc]` | List CodeMie models with per-million-token input/output/cache-read/cache-write pricing, sorted by price (default: total cost ascending) or context window. |
+
+```bash
+/codemie-prices                # cheapest (input+output) first
+/codemie-prices output desc    # most expensive output price first
+/codemie-prices context desc   # largest context window first
+```
+
 ## Provider
 
 Registers a single provider:

@@ -21,6 +21,8 @@ import { createServer } from "node:http";
 import { execFile } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
+import { Markdown } from "@earendil-works/pi-tui";
 
 const AUTH_FILE = join(homedir(), ".pi", "agent", "auth.json");
 const COOKIE_FILE = join(homedir(), ".pi", "agent", "codemie-cookie.txt");
@@ -595,4 +597,94 @@ export default async function (pi) {
       models: routedModels,
     });
   }
+
+  registerPricesCommand(pi);
+}
+
+// ---------------------------------------------------------------------------
+// /codemie-prices — cost-sortable pricing table for CodeMie models
+// ---------------------------------------------------------------------------
+
+const SORT_KEYS = { input: "input", output: "output", total: "total", context: "contextWindow" };
+
+function fmtRate(n) {
+  if (!n) return "free";
+  return `$${n < 1 ? n.toFixed(3) : n.toFixed(2)}`;
+}
+
+function fmtSize(n) {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1000).toFixed(0)}K`;
+  return String(n);
+}
+
+function buildPricesMarkdown(models, sortKey, desc) {
+  const rows = models
+    .map((m) => ({
+      id: m.id,
+      input: m.cost?.input ?? 0,
+      output: m.cost?.output ?? 0,
+      cacheRead: m.cost?.cacheRead ?? 0,
+      cacheWrite: m.cost?.cacheWrite ?? 0,
+      total: (m.cost?.input ?? 0) + (m.cost?.output ?? 0),
+      contextWindow: m.contextWindow ?? 0,
+      maxTokens: m.maxTokens ?? 0,
+    }))
+    .sort((a, b) => (desc ? b[sortKey] - a[sortKey] : a[sortKey] - b[sortKey]));
+
+  const lines = [
+    `# CodeMie model prices (per 1M tokens, sorted by ${sortKey}${desc ? " desc" : " asc"})`,
+    "",
+    "| Model | Input | Output | Cache Read | Cache Write | Context | Max Out |",
+    "|---|---|---|---|---|---|---|",
+    ...rows.map(
+      (r) =>
+        `| ${r.id} | ${fmtRate(r.input)} | ${fmtRate(r.output)} | ${fmtRate(r.cacheRead)} | ${fmtRate(
+          r.cacheWrite
+        )} | ${fmtSize(r.contextWindow)} | ${fmtSize(r.maxTokens)} |`
+    ),
+  ];
+  return lines.join("\n");
+}
+
+function registerPricesCommand(pi) {
+  pi.registerCommand("codemie-prices", {
+    description:
+      "List CodeMie models sorted by price (input/output/total/context); e.g. /codemie-prices output desc",
+    getArgumentCompletions(prefix) {
+      const items = [
+        ...Object.keys(SORT_KEYS).map((k) => ({ value: k, label: k })),
+        { value: "asc", label: "asc" },
+        { value: "desc", label: "desc" },
+      ];
+      const filtered = items.filter((i) => i.value.startsWith(prefix));
+      return filtered.length > 0 ? filtered : null;
+    },
+    handler: async (args, ctx) => {
+      const tokens = (args || "").trim().split(/\s+/).filter(Boolean);
+      const sortArg = tokens.find((t) => t in SORT_KEYS) || "total";
+      const desc = tokens.includes("desc");
+      const sortKey = SORT_KEYS[sortArg];
+
+      const models = ctx.modelRegistry.getAvailable().filter((m) => m.provider === "codemie");
+      if (models.length === 0) {
+        ctx.ui.notify("No CodeMie models available (not authenticated yet?).", "warning");
+        return;
+      }
+
+      const markdown = buildPricesMarkdown(models, sortKey, desc);
+
+      if (ctx.mode === "tui") {
+        pi.appendEntry("codemie-prices", { markdown });
+      } else {
+        ctx.ui.notify(markdown, "info");
+      }
+    },
+  });
+
+  pi.registerEntryRenderer("codemie-prices", (entry) => {
+    const data = entry.data;
+    const mdTheme = getMarkdownTheme();
+    return new Markdown(data.markdown, 1, 0, mdTheme);
+  });
 }
