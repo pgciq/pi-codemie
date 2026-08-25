@@ -9,10 +9,12 @@ Pi extension for [CodeMie (AI/Run)](https://github.com/codemie-ai/codemie-code) 
 
 ## Install
 
-### From npm (after publish)
+### From npm (recommended)
 ```bash
 pi install npm:pi-codemie
 ```
+
+[![npm](https://img.shields.io/npm/v/pi-codemie.svg)](https://www.npmjs.com/package/pi-codemie)
 
 ### From git
 ```bash
@@ -69,6 +71,17 @@ Registers a single provider:
 | Provider ID | Description |
 |---|---|
 | `codemie` | All CodeMie-deployed models. Non-Claude via OpenAI Chat Completions (`/v1`), Claude via native Anthropic Messages (`/v1/messages`). |
+
+## Development
+
+This package is published to npm via **GitHub Actions + npm Trusted Publishing (OIDC)** — no long-lived npm tokens are stored anywhere. Publishing is triggered by pushing a version tag:
+
+```bash
+npm version patch   # or minor / major
+git push && git push --tags
+```
+
+The workflow (`.github/workflows/publish.yml`) builds and publishes automatically once the tag lands, using npm's trusted publisher configured for `pgciq/pi-codemie`.
 
 ## License
 
