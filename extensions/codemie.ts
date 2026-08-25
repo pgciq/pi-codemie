@@ -885,12 +885,21 @@ function summarizeUsage(payload, theme) {
   return theme ? theme.fg(color, text) : text;
 }
 
+function isCodemieModel(model) {
+  return model?.provider === "codemie";
+}
+
 function registerUsageStatusBar(pi, getApiUrl, getAuthHeaders) {
   let timer;
   let inFlight = false;
+  // Only show/refresh the widget while a codemie/* model is actually active —
+  // switching to another provider (e.g. anthropic/openai/opencode) hides it,
+  // since the budget it reports is irrelevant to whatever model is now
+  // active. Switching back to a codemie/* model brings it back.
+  let active = false;
 
   async function refresh(ctx) {
-    if (inFlight) return;
+    if (!active || inFlight) return;
 
     const apiUrl = getApiUrl();
     const headers = getAuthHeaders();
@@ -908,10 +917,25 @@ function registerUsageStatusBar(pi, getApiUrl, getAuthHeaders) {
     }
   }
 
+  function setActive(nowActive, ctx) {
+    if (active === nowActive) return;
+    active = nowActive;
+    if (active) {
+      refresh(ctx);
+    } else {
+      ctx.ui.setStatus(USAGE_STATUS_KEY, undefined);
+    }
+  }
+
   pi.on("session_start", async (_event, ctx) => {
-    refresh(ctx);
+    active = isCodemieModel(ctx.model);
+    if (active) refresh(ctx);
     if (timer) clearInterval(timer);
     timer = setInterval(() => refresh(ctx), USAGE_REFRESH_INTERVAL_MS);
+  });
+
+  pi.on("model_select", async (event, ctx) => {
+    setActive(isCodemieModel(event.model), ctx);
   });
 
   pi.on("session_shutdown", async () => {

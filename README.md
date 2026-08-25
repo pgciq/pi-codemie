@@ -75,6 +75,8 @@ pi --model codemie/claude-opus-4-6 "你好"
 
 The footer/status bar also shows a compact live indicator (`💰 $spent/$limit (pct%)`), refreshed every 10 minutes. It sums the buckets pi's own requests actually charge (the plain account + `(premium)`); the `(cli)` bucket is excluded since it has been observed to always stay at $0 for pi/CodeMie-SSO usage. Note: `budget_usage` lags real spend by roughly 5-10 minutes (confirmed by timing real requests against repeated polls), so the indicator is not second-by-second live.
 
+The indicator only shows while a `codemie/*` model is the active model — switching to another provider (via `/model`, `Ctrl+P` cycling, or session restore) hides it immediately, since the budget it reports is irrelevant to a non-CodeMie model. Switching back to a `codemie/*` model brings it back.
+
 ```bash
 /codemie-prices                # cheapest (input+output) first
 /codemie-prices output desc    # most expensive output price first
