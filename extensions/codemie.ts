@@ -61,9 +61,9 @@ const RESPONSES_API_PATTERNS = [
   /^gpt-5-4-/,
   /^gpt-5\.4-/,
   /^gpt-5-5-/,
-  /^gpt-5-5-/,
+  /^gpt-5\.5-/,
   /^gpt-5-6-/,
-  /^gpt-5-6-/,
+  /^gpt-5\.6-/,
 ];
 
 function detectLimits(id) {
