@@ -599,6 +599,19 @@ export default async function (pi) {
   }
 
   registerPricesCommand(pi);
+  registerUsageCommand(pi, () => apiUrl, () => buildAuthHeaders());
+  registerUsageStatusBar(pi, () => apiUrl, () => buildAuthHeaders());
+
+  /** Headers for ad-hoc authenticated requests (usage/analytics), mirroring
+   * whichever auth mode is currently active. Re-read on every call so a
+   * post-login cookie refresh (persistSession) is picked up immediately. */
+  function buildAuthHeaders() {
+    if (envAuth?.headers) return { ...envAuth.headers };
+    if (envAuth?.apiKey) return { Authorization: `Bearer ${envAuth.apiKey}` };
+    const cookieString = process.env.CODEMIE_SESSION_COOKIE || "";
+    if (cookieString) return { Cookie: cookieString };
+    return {};
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -668,7 +681,7 @@ function registerPricesCommand(pi) {
 
       const models = ctx.modelRegistry.getAvailable().filter((m) => m.provider === "codemie");
       if (models.length === 0) {
-        ctx.ui.notify("No CodeMie models available (not authenticated yet?).", "warning");
+        notifyOrPrint(ctx, "No CodeMie models available (not authenticated yet?).");
         return;
       }
 
@@ -676,8 +689,11 @@ function registerPricesCommand(pi) {
 
       if (ctx.mode === "tui") {
         pi.appendEntry("codemie-prices", { markdown });
-      } else {
+      } else if (ctx.hasUI) {
         ctx.ui.notify(markdown, "info");
+      } else {
+        // print/json modes: notify() is a no-op (ctx.hasUI === false) — write directly.
+        console.log(markdown);
       }
     },
   });
@@ -686,5 +702,222 @@ function registerPricesCommand(pi) {
     const data = entry.data;
     const mdTheme = getMarkdownTheme();
     return new Markdown(data.markdown, 1, 0, mdTheme);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// /codemie-usage — account budget/quota usage
+// (confirmed endpoint, captured from the CodeMie web UI's Network panel:
+//  GET {apiUrl}/v1/analytics/budget_usage)
+// ---------------------------------------------------------------------------
+
+async function fetchBudgetUsage(apiUrl, headers) {
+  const res = await fetch(`${apiUrl.replace(/\/+$/, "")}/v1/analytics/budget_usage`, {
+    headers,
+    redirect: "follow",
+  });
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status} ${res.statusText}`);
+  }
+  return res.json();
+}
+
+/** notify() is a no-op outside TUI/RPC (ctx.hasUI === false in print/json) — fall
+ * back to stdout so print-mode/CI callers still see the message. */
+function notifyOrPrint(ctx, message, level = "warning") {
+  if (ctx.hasUI) ctx.ui.notify(message, level);
+  else console.log(message);
+}
+
+function fmtMoney(n) {
+  return typeof n === "number" && Number.isFinite(n) ? `$${n.toFixed(2)}` : String(n ?? "");
+}
+
+function fmtPercent(n) {
+  return typeof n === "number" && Number.isFinite(n) ? `${n.toFixed(1)}%` : String(n ?? "");
+}
+
+function fmtTimestamp(iso) {
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return String(iso ?? "");
+  return new Date(t).toISOString().replace("T", " ").replace(/\.\d+Z$/, " UTC");
+}
+
+/** Render an unknown JSON shape as markdown without assuming its schema:
+ * a flat array of objects becomes a table, a plain object becomes a
+ * key/value list, anything else is pretty-printed as a JSON code block. */
+function buildGenericMarkdown(data) {
+  const lines = ["# CodeMie budget usage", ""];
+
+  if (Array.isArray(data) && data.length > 0 && data.every((row) => row && typeof row === "object")) {
+    const keys = Array.from(new Set(data.flatMap((row) => Object.keys(row))));
+    lines.push(`| ${keys.join(" | ")} |`);
+    lines.push(`|${keys.map(() => "---").join("|")}|`);
+    for (const row of data) {
+      lines.push(`| ${keys.map((k) => String(row[k] ?? "")).join(" | ")} |`);
+    }
+    return lines.join("\n");
+  }
+
+  if (data && typeof data === "object" && !Array.isArray(data)) {
+    lines.push("| Field | Value |", "|---|---|");
+    for (const [key, value] of Object.entries(data)) {
+      const rendered =
+        value && typeof value === "object" ? "```json\n" + JSON.stringify(value, null, 2) + "\n```" : String(value);
+      lines.push(`| ${key} | ${rendered} |`);
+    }
+    return lines.join("\n");
+  }
+
+  lines.push("```json", JSON.stringify(data, null, 2), "```");
+  return lines.join("\n");
+}
+
+/**
+ * `/v1/analytics/budget_usage` returns `{ data: { columns, rows, totals }, metadata }`
+ * (a generic "report table" shape). Render the known `rows` fields
+ * (project_name, current_spending, budget_limit, total%, budget_reset_at,
+ * time_until_reset) as a friendly table; fall back to the generic renderer
+ * for anything that doesn't match this exact shape.
+ */
+function buildUsageMarkdown(payload) {
+  const rows = payload?.data?.rows;
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return buildGenericMarkdown(payload);
+  }
+
+  const asOf = payload?.metadata?.data_as_of;
+  const lines = [
+    "# CodeMie budget usage",
+    "",
+    asOf ? `_as of ${fmtTimestamp(asOf)}_` : undefined,
+    "_(budget_usage lags real spend by ~5-10 min; \"(cli)\" bucket excluded from the status-bar total — observed to never be charged by pi.)_",
+    "",
+    "| Project | Spent | Budget Limit | Used % | Resets At | Time Until Reset |",
+    "|---|---|---|---|---|---|",
+    ...rows.map((r) =>
+      `| ${r.project_name ?? ""} | ${fmtMoney(r.current_spending)} | ${fmtMoney(r.budget_limit)} | ${fmtPercent(
+        r.total
+      )} | ${fmtTimestamp(r.budget_reset_at)} | ${r.time_until_reset ?? ""} |`
+    ),
+  ].filter((l) => l !== undefined);
+
+  return lines.join("\n");
+}
+
+function registerUsageCommand(pi, getApiUrl, getAuthHeaders) {
+  pi.registerCommand("codemie-usage", {
+    description: "Show current CodeMie account budget/quota usage.",
+    handler: async (_args, ctx) => {
+      const apiUrl = getApiUrl();
+      const headers = getAuthHeaders();
+      if (!apiUrl || Object.keys(headers).length === 0) {
+        notifyOrPrint(ctx, "Not authenticated with CodeMie yet — run /login codemie first.");
+        return;
+      }
+      let data;
+      try {
+        data = await fetchBudgetUsage(apiUrl, headers);
+      } catch (error) {
+        notifyOrPrint(
+          ctx,
+          `Failed to fetch CodeMie budget usage (${error instanceof Error ? error.message : String(error)}).`
+        );
+        return;
+      }
+
+      const markdown = buildUsageMarkdown(data);
+      if (ctx.mode === "tui") {
+        pi.appendEntry("codemie-usage", { markdown });
+      } else if (ctx.hasUI) {
+        ctx.ui.notify(markdown, "info");
+      } else {
+        // print/json modes: notify() is a no-op (ctx.hasUI === false) — write directly.
+        console.log(markdown);
+      }
+    },
+  });
+
+  pi.registerEntryRenderer("codemie-usage", (entry) => {
+    const data = entry.data;
+    const mdTheme = getMarkdownTheme();
+    return new Markdown(data.markdown, 1, 0, mdTheme);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Status bar — compact budget usage, refreshed periodically + after turns
+// ---------------------------------------------------------------------------
+
+const USAGE_STATUS_KEY = "codemie-usage";
+// The backend aggregates spend in batches — measured ~5-10 min lag between an
+// actual request and budget_usage reflecting it (confirmed empirically: cost
+// showed up in the API response immediately, but budget_usage stayed frozen
+// for 3+ minutes before updating). Polling more often than that just wastes
+// requests, so there is no turn_end-triggered refresh — background poll only.
+const USAGE_REFRESH_INTERVAL_MS = 10 * 60 * 1000;
+
+// Buckets actually charged by pi/CodeMie API usage. The "(cli)" bucket has
+// been observed to stay at $0 across real usage — it appears to be reserved
+// for a different auth path (CodeMie's own CLI with a dedicated API key) and
+// including its budget_limit in the denominator would understate the real
+// usage percentage. Only sum buckets whose project_name does NOT end in
+// "(cli)".
+function isCliBucket(projectName) {
+  return typeof projectName === "string" && /\(cli\)\s*$/i.test(projectName);
+}
+
+/** Aggregate the buckets that pi's own requests actually charge (main +
+ * premium, excluding the always-$0 "(cli)" bucket) into one compact line. */
+function summarizeUsage(payload, theme) {
+  const rows = payload?.data?.rows;
+  if (!Array.isArray(rows) || rows.length === 0) return undefined;
+
+  const relevant = rows.filter((r) => !isCliBucket(r.project_name));
+  const usedRows = relevant.length > 0 ? relevant : rows;
+
+  const spent = usedRows.reduce((s, r) => s + (typeof r.current_spending === "number" ? r.current_spending : 0), 0);
+  const limit = usedRows.reduce((s, r) => s + (typeof r.budget_limit === "number" ? r.budget_limit : 0), 0);
+  const pct = limit > 0 ? (spent / limit) * 100 : 0;
+
+  const color = pct >= 90 ? "error" : pct >= 70 ? "warning" : "dim";
+  const text = `💰 $${spent.toFixed(2)}/$${limit.toFixed(2)} (${pct.toFixed(1)}%)`;
+  return theme ? theme.fg(color, text) : text;
+}
+
+function registerUsageStatusBar(pi, getApiUrl, getAuthHeaders) {
+  let timer;
+  let inFlight = false;
+
+  async function refresh(ctx) {
+    if (inFlight) return;
+
+    const apiUrl = getApiUrl();
+    const headers = getAuthHeaders();
+    if (!apiUrl || Object.keys(headers).length === 0) return; // not authenticated yet
+
+    inFlight = true;
+    try {
+      const payload = await fetchBudgetUsage(apiUrl, headers);
+      const summary = summarizeUsage(payload, ctx.ui.theme);
+      if (summary) ctx.ui.setStatus(USAGE_STATUS_KEY, summary);
+    } catch {
+      // Best-effort background refresh — keep whatever status was shown before.
+    } finally {
+      inFlight = false;
+    }
+  }
+
+  pi.on("session_start", async (_event, ctx) => {
+    refresh(ctx);
+    if (timer) clearInterval(timer);
+    timer = setInterval(() => refresh(ctx), USAGE_REFRESH_INTERVAL_MS);
+  });
+
+  pi.on("session_shutdown", async () => {
+    if (timer) {
+      clearInterval(timer);
+      timer = undefined;
+    }
   });
 }

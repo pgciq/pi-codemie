@@ -71,11 +71,16 @@ pi --model codemie/claude-opus-4-6 "你好"
 | Command | Description |
 |---|---|
 | `/codemie-prices [input\|output\|total\|context] [asc\|desc]` | List CodeMie models with per-million-token input/output/cache-read/cache-write pricing, sorted by price (default: total cost ascending) or context window. |
+| `/codemie-usage` | Show current CodeMie account budget/quota usage (`GET {apiUrl}/v1/analytics/budget_usage`). |
+
+The footer/status bar also shows a compact live indicator (`💰 $spent/$limit (pct%)`), refreshed every 10 minutes. It sums the buckets pi's own requests actually charge (the plain account + `(premium)`); the `(cli)` bucket is excluded since it has been observed to always stay at $0 for pi/CodeMie-SSO usage. Note: `budget_usage` lags real spend by roughly 5-10 minutes (confirmed by timing real requests against repeated polls), so the indicator is not second-by-second live.
 
 ```bash
 /codemie-prices                # cheapest (input+output) first
 /codemie-prices output desc    # most expensive output price first
 /codemie-prices context desc   # largest context window first
+
+/codemie-usage                 # current account budget/quota usage
 ```
 
 ## Provider
