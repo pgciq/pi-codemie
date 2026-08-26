@@ -12,21 +12,45 @@
 //                  automatically when an actual CodeMie request needs a refresh.
 //   CODEMIE_MODEL – static fallback model id when live model discovery fails.
 //
-// Registers a single provider:
-//   codemie – all models; non-Claude via OpenAI Chat Completions ({apiUrl}/v1),
-//   claude-* via native Anthropic Messages ({apiUrl}/v1/messages).
+// Billing channel (same account, same session — NOT a second account):
+//   CodeMie's backend attributes spend to one of several LiteLLM buckets per
+//   user (see `/codemie-usage`: a plain "Web/Platform" row, a "(cli)" row,
+//   a "(premium)" row). CONFIRMED by measurement (4 isolated test configs,
+//   before/after budget_usage comparisons — see README "Two billing
+//   channels"): the header that actually decides bucket attribution is
+//   `X-CodeMie-Project` (the account's email/username), PLUS
+//   `X-CodeMie-Session-ID`/`X-CodeMie-Request-ID` needing to be *validly
+//   formatted UUIDs* (not necessarily unique per request). Sending only
+//   `X-CodeMie-Client`/`X-CodeMie-CLI` (no Project, or malformed UUIDs) does
+//   nothing — confirmed twice. Sending the full set including a correct
+//   `X-CodeMie-Project` reliably shifts spend into the "(cli)" bucket — also
+//   confirmed twice, on the SAME SSO-cookie session `codemie` uses, no JWT
+//   or second account required. This mirrors codemie-code's own
+//   HeaderInjectionPlugin, which sends this exact header set on every
+//   request its local proxy forwards.
+//
+// Registers two providers, both backed by the same credentials:
+//   codemie      – all models, billed to the plain Web/Platform bucket.
+//                  Non-Claude via OpenAI Chat Completions ({apiUrl}/v1),
+//                  Claude via native Anthropic Messages ({apiUrl}/v1/messages).
+//   codemie-cli  – identical models/routing/credentials, billed to the "(cli)"
+//                  bucket via X-CodeMie-Client/X-CodeMie-CLI/X-CodeMie-Project
+//                  (+ valid-UUID Session-ID/Request-ID) headers.
 
 import { existsSync, readFileSync, writeFileSync, chmodSync } from "node:fs";
 import { createServer } from "node:http";
 import { execFile } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { randomUUID } from "node:crypto";
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { Markdown } from "@earendil-works/pi-tui";
 
 const AUTH_FILE = join(homedir(), ".pi", "agent", "auth.json");
 const COOKIE_FILE = join(homedir(), ".pi", "agent", "codemie-cookie.txt");
-const PROVIDER_IDS = ["codemie"];
+// Both provider ids share one OAuth session/credential set (see the
+// "Billing channel" note above) — kept in sync in ~/.pi/agent/auth.json.
+const PROVIDER_IDS = ["codemie", "codemie-cli"];
 const LOGIN_TIMEOUT_MS = 120_000;
 // Default CodeMie instance — override with CODEMIE_BASE_URL.
 const DEFAULT_CODEMIE_URL = "https://codemie.lab.epam.com";
@@ -396,6 +420,65 @@ async function fetchCodeMieModels(apiUrl, { bearer, cookieString }) {
   return models.filter((m) => m && m.enabled !== false).map(convertLlmModel);
 }
 
+/**
+ * Resolve the CodeMie project id for the `X-CodeMie-Project` header (see the
+ * "Billing channel" note above — this is the header that actually decides
+ * bucket attribution). Mirrors codemie-code's `fetchCodeMieUserInfo`
+ * (`GET {apiUrl}/v1/user`): `username`/`email` is the account's email, which
+ * is also the LiteLLM project name (`<email>`, `<email> (cli)`, ...).
+ */
+async function fetchCodeMieProject(apiUrl, { bearer, cookieString }) {
+  const headers = {};
+  if (cookieString) headers["Cookie"] = cookieString;
+  else if (bearer) headers["Authorization"] = `Bearer ${bearer}`;
+
+  const res = await fetch(`${apiUrl.replace(/\/+$/, "")}/v1/user`, {
+    headers,
+    redirect: "follow",
+  });
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status} ${res.statusText}`);
+  }
+  const user = await res.json();
+  const project = user?.username || user?.email;
+  if (!project) {
+    throw new Error("user info response missing username/email");
+  }
+  return project;
+}
+
+/**
+ * Claude models are flagged to speak the Anthropic Messages protocol at the
+ * API root (preserving native thinking/caching), everything else uses
+ * OpenAI Chat Completions under /v1. Shared by both the `codemie` and
+ * `codemie-cli` providers.
+ */
+function routeModels(entries, apiUrl) {
+  return entries.map((entry) => {
+    if (!entry.id.startsWith("claude")) {
+      return { ...entry, compat: { ...entry.compat, supportsReasoningEffort: true } };
+    }
+    return {
+      ...entry,
+      api: "anthropic-messages",
+      baseUrl: apiUrl, // Anthropic endpoint lives at the API root, not /v1
+    };
+  });
+}
+
+/** Seed model list used when no session/model-discovery is available yet. */
+function seedModels() {
+  const SEED_MODELS = [
+    "gpt-5-mini-2025-08-07",
+    "gpt-5.1-codex-2025-11-13",
+    "gemini-3-pro",
+    "deepseek-v4-pro",
+    "claude-sonnet-4-6",
+    "claude-opus-4-6",
+  ];
+  return SEED_MODELS.map((id) => convertLlmModel({ deployment_name: id }));
+}
+
 // ---------------------------------------------------------------------------
 // Extension entry point
 // ---------------------------------------------------------------------------
@@ -548,32 +631,12 @@ export default async function (pi) {
   if (entries.length === 0) {
     // No session yet — still register the provider (so /login codemie exists
     // and models are selectable); after login the real list loads on restart.
-    const SEED_MODELS = [
-      "gpt-5-mini-2025-08-07",
-      "gpt-5.1-codex-2025-11-13",
-      "gemini-3-pro",
-      "deepseek-v4-pro",
-      "claude-sonnet-4-6",
-      "claude-opus-4-6",
-    ];
-    entries = SEED_MODELS.map((id) => convertLlmModel({ deployment_name: id }));
+    entries = seedModels();
   }
 
   // ---- Provider registration ----------------------------------------------
 
-  // Single provider: Claude models are flagged to speak the Anthropic
-  // Messages protocol at the API root (preserving native thinking/caching),
-  // everything else uses OpenAI Chat Completions under /v1.
-  const routedModels = entries.map((entry) => {
-    if (!entry.id.startsWith("claude")) {
-      return { ...entry, compat: { ...entry.compat, supportsReasoningEffort: true } };
-    }
-    return {
-      ...entry,
-      api: "anthropic-messages",
-      baseUrl: apiUrl, // Anthropic endpoint lives at the API root, not /v1
-    };
-  });
+  const routedModels = routeModels(entries, apiUrl);
 
   const authConfig = envAuth
     ? envAuth
@@ -598,10 +661,6 @@ export default async function (pi) {
     });
   }
 
-  registerPricesCommand(pi);
-  registerUsageCommand(pi, () => apiUrl, () => buildAuthHeaders());
-  registerUsageStatusBar(pi, () => apiUrl, () => buildAuthHeaders());
-
   /** Headers for ad-hoc authenticated requests (usage/analytics), mirroring
    * whichever auth mode is currently active. Re-read on every call so a
    * post-login cookie refresh (persistSession) is picked up immediately. */
@@ -612,6 +671,83 @@ export default async function (pi) {
     if (cookieString) return { Cookie: cookieString };
     return {};
   }
+
+  // ---- codemie-cli: SAME account/session, different billing channel -------
+  //
+  // CONFIRMED by measurement (before/after `/codemie-usage` across 4
+  // isolated test configurations — see README "Two billing channels"): the
+  // header that actually decides bucket attribution is `X-CodeMie-Project`
+  // (plus `X-CodeMie-Session-ID`/`X-CodeMie-Request-ID` needing to be
+  // *valid UUIDs*, though NOT unique per request). Sending
+  // `X-CodeMie-Client`/`X-CodeMie-CLI` alone (no Project, or malformed
+  // UUIDs) does nothing — spend still lands in the plain Web/Platform
+  // bucket. Adding a correctly-formed `X-CodeMie-Project` (the account's
+  // email/username, from `GET {apiUrl}/v1/user`) on top of the SAME
+  // SSO-cookie session used by `codemie` reliably shifts spend into the
+  // "(cli)" bucket instead — reproduced twice, no separate account, no JWT
+  // needed. This mirrors codemie-code's own HeaderInjectionPlugin, which
+  // sends this exact header set on every request its proxy forwards.
+  const cliSessionId = randomUUID();
+  const cliRequestId = randomUUID();
+  const cliChannelHeaders = {
+    "X-CodeMie-Client": "codemie-pi",
+    "X-CodeMie-CLI": "codemie-cli/1.0.0",
+    "X-CodeMie-Session-ID": cliSessionId,
+    "X-CodeMie-Request-ID": cliRequestId,
+  };
+
+  // Best-effort: resolve the account's project (email/username) so the
+  // gateway can attribute spend to `<project> (cli)`. Uses the exact same
+  // credentials as `codemie` (cookie or Bearer, whichever is active) — no
+  // extra login. If this fails (offline, stale session, etc.), `codemie-cli`
+  // still registers without `X-CodeMie-Project` and falls back to behaving
+  // like `codemie` (billed to the plain bucket) until the next restart.
+  let cliProject;
+  try {
+    const cookies = oauthCreds ? cookieStringFromCredential(oauthCreds) : "";
+    cliProject = await fetchCodeMieProject(apiUrl, {
+      bearer: envAuth?.apiKey,
+      cookieString: envAuth?.headers?.Cookie ?? cookies,
+    });
+  } catch (error) {
+    console.error(
+      `[codemie-cli] Could not resolve account project for X-CodeMie-Project (${
+        error instanceof Error ? error.message : String(error)
+      }); "(cli)" bucket attribution may not work until next restart.`
+    );
+  }
+  if (cliProject) cliChannelHeaders["X-CodeMie-Project"] = cliProject;
+
+  if (routedModels.length > 0) {
+    // Clone (deep enough: top-level model + nested cost/compat/thinkingLevelMap
+    // objects) rather than reusing `routedModels`/nested objects by reference
+    // across two registerProvider() calls, in case pi/pi-ai attaches
+    // per-registration state (e.g. a resolved `provider` id) onto the model
+    // objects it's given.
+    const cliModels = routedModels.map((m) => ({
+      ...m,
+      cost: { ...m.cost },
+      ...(m.compat ? { compat: { ...m.compat } } : {}),
+      ...(m.thinkingLevelMap ? { thinkingLevelMap: { ...m.thinkingLevelMap } } : {}),
+    }));
+    pi.registerProvider("codemie-cli", {
+      name: "CodeMie (CLI billing channel)",
+      baseUrl: `${apiUrl}/v1`,
+      ...authConfig,
+      headers: { ...(authConfig?.headers ?? {}), ...cliChannelHeaders },
+      api: "openai-completions",
+      models: cliModels,
+    });
+  }
+
+  registerPricesCommand(pi);
+  registerUsageCommand(pi, () => apiUrl, () => buildAuthHeaders());
+  // Both status widgets read the SAME account's budget_usage response (one
+  // account, multiple buckets) — they differ only in which row(s) they sum:
+  // "codemie" excludes the "(cli)" row (that's the OTHER provider's spend),
+  // "codemie-cli" shows ONLY the "(cli)" row.
+  registerUsageStatusBar(pi, "codemie", "codemie-usage-status", "💰", "web", () => apiUrl, () => buildAuthHeaders());
+  registerUsageStatusBar(pi, "codemie-cli", "codemie-cli-usage-status", "🖥️", "cli", () => apiUrl, () => buildAuthHeaders());
 }
 
 // ---------------------------------------------------------------------------
@@ -660,6 +796,8 @@ function buildPricesMarkdown(models, sortKey, desc) {
   return lines.join("\n");
 }
 
+// `codemie` and `codemie-cli` register the exact same model list (only the
+// billing-channel headers differ), so pricing is shown once from `codemie`.
 function registerPricesCommand(pi) {
   pi.registerCommand("codemie-prices", {
     description:
@@ -722,6 +860,38 @@ async function fetchBudgetUsage(apiUrl, headers) {
   return res.json();
 }
 
+/**
+ * `budget_usage` lags real spend by ~5-10 min. The analytics *insights*
+ * dashboard (https://{host}/analytics?tab=insights) is backed by a
+ * different, much faster endpoint set — confirmed by timing: a token-count
+ * bump showed up within ~20-30s of a real request, vs. minutes for
+ * `budget_usage`. `cli-summary` reports CLI-proxy-channel traffic only
+ * (i.e. requests carrying `X-CodeMie-Client`, like `codemie-cli`'s) — it
+ * won't move for plain `codemie` usage. Used as a best-effort supplement to
+ * `/codemie-usage`, not a replacement (it has no per-bucket $ breakdown).
+ */
+async function fetchCliInsightsSummary(apiUrl, headers, timePeriod = "last_24_hours") {
+  const res = await fetch(
+    `${apiUrl.replace(/\/+$/, "")}/v1/analytics/cli-summary?time_period=${encodeURIComponent(timePeriod)}`,
+    { headers, redirect: "follow" }
+  );
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status} ${res.statusText}`);
+  }
+  return res.json();
+}
+
+/** Flatten `{ data: { metrics: [{ id, value }, ...] } }` into `{ id: value }`. */
+function summarizeCliInsights(payload) {
+  const metrics = payload?.data?.metrics;
+  if (!Array.isArray(metrics)) return undefined;
+  const byId = {};
+  for (const m of metrics) {
+    if (m && typeof m === "object" && typeof m.id === "string") byId[m.id] = m.value;
+  }
+  return byId;
+}
+
 /** notify() is a no-op outside TUI/RPC (ctx.hasUI === false in print/json) — fall
  * back to stdout so print-mode/CI callers still see the message. */
 function notifyOrPrint(ctx, message, level = "warning") {
@@ -780,10 +950,49 @@ function buildGenericMarkdown(data) {
  * time_until_reset) as a friendly table; fall back to the generic renderer
  * for anything that doesn't match this exact shape.
  */
-function buildUsageMarkdown(payload) {
+function fmtNumber(n) {
+  return typeof n === "number" && Number.isFinite(n) ? n.toLocaleString("en-US") : String(n ?? "");
+}
+
+/**
+ * Renders the fast `cli-summary` metrics (see fetchCliInsightsSummary) as a
+ * compact table, plus a link to the full insights dashboard. `insights` is
+ * the flattened `{ id: value }` map from summarizeCliInsights(), or
+ * undefined if that fetch failed/was skipped — in which case only the link
+ * is shown so /codemie-usage still degrades gracefully.
+ */
+function buildInsightsSection(insights, dashboardUrl) {
+  const lines = [
+    "",
+    "## CLI channel (fast, near real-time)",
+    "",
+    `_from \`/v1/analytics/cli-summary\` — updates within ~20-30s of a request, unlike the budget table above. Covers \`codemie-cli/*\` (and any other CLI/agent client) traffic only; not broken out by $ bucket._`,
+  ];
+
+  if (insights) {
+    lines.push(
+      "",
+      "| Metric | Value |",
+      "|---|---|",
+      `| CLI cost (last 24h) | ${fmtMoney(insights.cli_cost)} |`,
+      `| Total tokens (last 24h) | ${fmtNumber(insights.total_tokens)} |`,
+      `| Sessions (last 24h) | ${fmtNumber(insights.unique_sessions)} |`
+    );
+  } else {
+    lines.push("", "_(could not fetch — see warning above; the dashboard link below still works.)_");
+  }
+
+  if (dashboardUrl) {
+    lines.push("", `Full breakdown (per-client, per-repo, sessions, tools): ${dashboardUrl}/analytics?tab=insights`);
+  }
+
+  return lines.join("\n");
+}
+
+function buildUsageMarkdown(payload, insights, dashboardUrl) {
   const rows = payload?.data?.rows;
   if (!Array.isArray(rows) || rows.length === 0) {
-    return buildGenericMarkdown(payload);
+    return buildGenericMarkdown(payload) + "\n" + buildInsightsSection(insights, dashboardUrl);
   }
 
   const asOf = payload?.metadata?.data_as_of;
@@ -791,7 +1000,11 @@ function buildUsageMarkdown(payload) {
     "# CodeMie budget usage",
     "",
     asOf ? `_as of ${fmtTimestamp(asOf)}_` : undefined,
-    "_(budget_usage lags real spend by ~5-10 min; \"(cli)\" bucket excluded from the status-bar total — observed to never be charged by pi.)_",
+    "_(budget_usage lags real spend by ~5-10 min. Same account, three billing " +
+      "channels: the plain row is Web/Platform, \"(cli)\" is `codemie-cli/*` " +
+      "usage, \"(premium)\" is premium-model usage from either. The status bar " +
+      "shows the plain+premium total while a `codemie/*` model is active, and " +
+      "the \"(cli)\" total while a `codemie-cli/*` model is active.)_",
     "",
     "| Project | Spent | Budget Limit | Used % | Resets At | Time Until Reset |",
     "|---|---|---|---|---|---|",
@@ -802,12 +1015,17 @@ function buildUsageMarkdown(payload) {
     ),
   ].filter((l) => l !== undefined);
 
-  return lines.join("\n");
+  return lines.join("\n") + "\n" + buildInsightsSection(insights, dashboardUrl);
 }
 
+/**
+ * Registers `/codemie-usage`, showing the full budget_usage table (all
+ * buckets/rows: Web/Platform, "(cli)", "(premium)", ...) for the one CodeMie
+ * account shared by both `codemie` and `codemie-cli`.
+ */
 function registerUsageCommand(pi, getApiUrl, getAuthHeaders) {
   pi.registerCommand("codemie-usage", {
-    description: "Show current CodeMie account budget/quota usage.",
+    description: "Show current CodeMie account budget/quota usage (all billing channels).",
     handler: async (_args, ctx) => {
       const apiUrl = getApiUrl();
       const headers = getAuthHeaders();
@@ -826,7 +1044,21 @@ function registerUsageCommand(pi, getApiUrl, getAuthHeaders) {
         return;
       }
 
-      const markdown = buildUsageMarkdown(data);
+      // Best-effort supplement: the fast insights endpoint. Its failure
+      // should not block showing the (already-fetched) budget table above.
+      let insights;
+      try {
+        insights = summarizeCliInsights(await fetchCliInsightsSummary(apiUrl, headers));
+      } catch (error) {
+        console.error(
+          `[codemie-usage] Could not fetch fast CLI insights (${
+            error instanceof Error ? error.message : String(error)
+          }); showing budget table only.`
+        );
+      }
+      const dashboardUrl = frontendFromApiBase(apiUrl);
+
+      const markdown = buildUsageMarkdown(data, insights, dashboardUrl);
       if (ctx.mode === "tui") {
         pi.appendEntry("codemie-usage", { markdown });
       } else if (ctx.hasUI) {
@@ -849,7 +1081,6 @@ function registerUsageCommand(pi, getApiUrl, getAuthHeaders) {
 // Status bar — compact budget usage, refreshed periodically + after turns
 // ---------------------------------------------------------------------------
 
-const USAGE_STATUS_KEY = "codemie-usage";
 // The backend aggregates spend in batches — measured ~5-10 min lag between an
 // actual request and budget_usage reflecting it (confirmed empirically: cost
 // showed up in the API response immediately, but budget_usage stayed frozen
@@ -857,45 +1088,52 @@ const USAGE_STATUS_KEY = "codemie-usage";
 // requests, so there is no turn_end-triggered refresh — background poll only.
 const USAGE_REFRESH_INTERVAL_MS = 10 * 60 * 1000;
 
-// Buckets actually charged by pi/CodeMie API usage. The "(cli)" bucket has
-// been observed to stay at $0 across real usage — it appears to be reserved
-// for a different auth path (CodeMie's own CLI with a dedicated API key) and
-// including its budget_limit in the denominator would understate the real
-// usage percentage. Only sum buckets whose project_name does NOT end in
-// "(cli)".
+// One account, several LiteLLM billing buckets (rows), keyed by project_name
+// suffix: plain email = Web/Platform, "(cli)" = codemie-cli/* usage, "(premium)"
+// = premium-model usage. `bucket: "web"` sums every row EXCEPT "(cli)" (i.e.
+// what `codemie/*` spends); `bucket: "cli"` sums ONLY the "(cli)" row (i.e.
+// what `codemie-cli/*` spends).
 function isCliBucket(projectName) {
   return typeof projectName === "string" && /\(cli\)\s*$/i.test(projectName);
 }
 
-/** Aggregate the buckets that pi's own requests actually charge (main +
- * premium, excluding the always-$0 "(cli)" bucket) into one compact line. */
-function summarizeUsage(payload, theme) {
+/** Aggregate the row(s) belonging to one billing bucket into one compact line. */
+function summarizeUsage(payload, theme, emoji, bucket) {
   const rows = payload?.data?.rows;
   if (!Array.isArray(rows) || rows.length === 0) return undefined;
 
-  const relevant = rows.filter((r) => !isCliBucket(r.project_name));
-  const usedRows = relevant.length > 0 ? relevant : rows;
+  const usedRows =
+    bucket === "cli" ? rows.filter((r) => isCliBucket(r.project_name)) : rows.filter((r) => !isCliBucket(r.project_name));
+  if (usedRows.length === 0) return undefined;
 
   const spent = usedRows.reduce((s, r) => s + (typeof r.current_spending === "number" ? r.current_spending : 0), 0);
   const limit = usedRows.reduce((s, r) => s + (typeof r.budget_limit === "number" ? r.budget_limit : 0), 0);
   const pct = limit > 0 ? (spent / limit) * 100 : 0;
 
   const color = pct >= 90 ? "error" : pct >= 70 ? "warning" : "dim";
-  const text = `💰 $${spent.toFixed(2)}/$${limit.toFixed(2)} (${pct.toFixed(1)}%)`;
+  const text = `${emoji} $${spent.toFixed(2)}/$${limit.toFixed(2)} (${pct.toFixed(1)}%)`;
   return theme ? theme.fg(color, text) : text;
 }
 
-function isCodemieModel(model) {
-  return model?.provider === "codemie";
+function isProviderModel(model, providerId) {
+  return model?.provider === providerId;
 }
 
-function registerUsageStatusBar(pi, getApiUrl, getAuthHeaders) {
+/**
+ * Registers a status-bar widget showing compact budget usage for one
+ * billing bucket, visible only while a model from `providerId` is active.
+ * Called once for `codemie` (bucket: "web") and once for `codemie-cli`
+ * (bucket: "cli") — both read the SAME account's budget_usage response
+ * (same getApiUrl/getAuthHeaders), just summing different row(s), so both
+ * can be shown side by side without clobbering each other.
+ */
+function registerUsageStatusBar(pi, providerId, statusKey, emoji, bucket, getApiUrl, getAuthHeaders) {
   let timer;
   let inFlight = false;
-  // Only show/refresh the widget while a codemie/* model is actually active —
-  // switching to another provider (e.g. anthropic/openai/opencode) hides it,
-  // since the budget it reports is irrelevant to whatever model is now
-  // active. Switching back to a codemie/* model brings it back.
+  // Only show/refresh the widget while a model from this provider is
+  // actually active — switching to another provider hides it, since the
+  // budget it reports is irrelevant to whatever model is now active.
+  // Switching back brings it back.
   let active = false;
 
   async function refresh(ctx) {
@@ -908,8 +1146,8 @@ function registerUsageStatusBar(pi, getApiUrl, getAuthHeaders) {
     inFlight = true;
     try {
       const payload = await fetchBudgetUsage(apiUrl, headers);
-      const summary = summarizeUsage(payload, ctx.ui.theme);
-      if (summary) ctx.ui.setStatus(USAGE_STATUS_KEY, summary);
+      const summary = summarizeUsage(payload, ctx.ui.theme, emoji, bucket);
+      if (summary) ctx.ui.setStatus(statusKey, summary);
     } catch {
       // Best-effort background refresh — keep whatever status was shown before.
     } finally {
@@ -923,19 +1161,19 @@ function registerUsageStatusBar(pi, getApiUrl, getAuthHeaders) {
     if (active) {
       refresh(ctx);
     } else {
-      ctx.ui.setStatus(USAGE_STATUS_KEY, undefined);
+      ctx.ui.setStatus(statusKey, undefined);
     }
   }
 
   pi.on("session_start", async (_event, ctx) => {
-    active = isCodemieModel(ctx.model);
+    active = isProviderModel(ctx.model, providerId);
     if (active) refresh(ctx);
     if (timer) clearInterval(timer);
     timer = setInterval(() => refresh(ctx), USAGE_REFRESH_INTERVAL_MS);
   });
 
   pi.on("model_select", async (event, ctx) => {
-    setActive(isCodemieModel(event.model), ctx);
+    setActive(isProviderModel(event.model, providerId), ctx);
   });
 
   pi.on("session_shutdown", async () => {

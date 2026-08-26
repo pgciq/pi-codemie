@@ -38,6 +38,97 @@ pi install /path/to/pi-codemie
 | `CODEMIE_COOKIE` | Raw session cookie (CI mode). |
 | `CODEMIE_MODEL` | Static fallback model ID when live model discovery fails. |
 
+### Two billing channels, same account: `codemie` vs `codemie-cli`
+
+CodeMie's backend splits each account's spend across multiple LiteLLM budget
+buckets. `/codemie-usage` typically shows something like:
+
+```
+| Project                     | Spent  | Budget Limit | ... |
+| you@example.com (cli)       | $0.06  | $150.00      | ... |   ← "CLI" bucket, usually idle/underused
+| you@example.com              | $14.92 | $120.00      | ... |   ← "Web/Platform" bucket
+| you@example.com (premium)   | $0.13  | $30.00       | ... |   ← premium-model bucket
+```
+
+**Confirmed mechanism** (4 isolated test configurations, each verified with a
+before/after `/codemie-usage` comparison across several real requests):
+
+1. Sending only `X-CodeMie-Client`/`X-CodeMie-CLI` on top of the plain
+   OAuth-SSO cookie session — **no effect**, spend stayed in the plain
+   Web/Platform bucket.
+2. Routing through codemie-code's own local proxy daemon (`codemie proxy
+   start`, which re-authenticates upstream with that same SSO session but
+   injects its full header set) — **worked**, shifted spend into "(cli)".
+3. Direct-to-gateway (no local proxy) with that same full header set copied
+   exactly — **worked** identically to (2).
+4. Same as (3) minus `X-CodeMie-Project` — **no effect** again.
+
+The deciding header is **`X-CodeMie-Project`** (the account's email/username,
+tied to which LiteLLM budget row a request is charged against), together with
+`X-CodeMie-Session-ID`/`X-CodeMie-Request-ID` needing to be **validly
+formatted UUIDs** (they do not need to be unique per request — reusing the
+same two UUIDs across multiple requests still worked). No JWT, no separate
+account, no second login required — it's the exact same OAuth-SSO cookie
+session `codemie` uses, just with `codemie-cli` adding:
+
+```
+X-CodeMie-Client:     codemie-pi
+X-CodeMie-CLI:        codemie-cli/1.0.0
+X-CodeMie-Project:    <resolved from GET {apiUrl}/v1/user — username/email>
+X-CodeMie-Session-ID: <a UUID, generated once per pi process>
+X-CodeMie-Request-ID: <a UUID, generated once per pi process>
+```
+
+`codemie-cli` resolves `X-CodeMie-Project` automatically at startup (same
+credentials as `codemie`, no extra config needed):
+
+```bash
+pi --model codemie/gpt-5.1-codex "..."      # billed to the plain Web/Platform bucket
+pi --model codemie-cli/gpt-5.1-codex "..."  # billed to the "(cli)" bucket — same account
+```
+
+If the `/v1/user` lookup fails at startup (offline, stale session, etc.),
+`codemie-cli` still registers without `X-CodeMie-Project` and falls back to
+behaving like `codemie` (billed to the plain bucket) until the next restart—
+check the startup log for a `[codemie-cli] Could not resolve account project`
+warning if `/codemie-usage` shows spend landing in the wrong bucket.
+
+#### Faster verification: the analytics insights endpoints
+
+`/codemie-usage` (`/v1/analytics/budget_usage`) lags real spend by roughly
+5-10 minutes, which makes it slow for confirming `codemie-cli` is actually
+billing the "(cli)" bucket after a config change. The
+[CodeMie analytics dashboard](https://codemie.lab.epam.com/analytics?tab=insights)
+is backed by a different, much faster set of endpoints (confirmed by timing:
+a token-count bump showed up within ~20-30 seconds of a real request, vs.
+minutes for `budget_usage`).
+
+**`/codemie-usage` fetches this automatically** — alongside the budget table,
+it shows a "CLI channel (fast, near real-time)" section from
+`GET /v1/analytics/cli-summary` (`cli_cost`/`total_tokens`/`unique_sessions`
+for CLI-proxy traffic specifically, i.e. requests carrying `X-CodeMie-Client`
+like `codemie-cli`'s — it won't move for plain `codemie` usage) plus a direct
+link to the full dashboard. If that fetch fails (network hiccup, etc.),
+`/codemie-usage` still shows the budget table and just the dashboard link.
+
+For a deeper per-client breakdown than the command surfaces, query the
+endpoints directly with the same session cookie `codemie-cli` uses:
+
+```bash
+# Per X-CodeMie-Client value (confirms codemie-pi is what's being counted)
+curl -s "https://codemie.lab.epam.com/code-assistant-api/v1/analytics/cli-agents?time_period=last_24_hours" \
+  -H "Cookie: <your _oauth2_proxy session cookie>"
+# → { "data": { "rows": [{ "client_name": "codemie-pi", "total_usage": N }] } }
+```
+
+`cli-insights-user-detail?user_name=<your email>` includes a
+`repository_classifications[]` array with a `client` field and its own
+per-client session/cost — useful to see `codemie-pi` broken out from other
+CLI clients (Claude Code, Codex, ...) hitting the same account. Small/cheap
+requests may not move `cli_cost` by a visible cent even though `total_tokens`
+already reflects them — token count is the more sensitive signal for quick
+sanity checks.
+
 ### OAuth SSO login (recommended)
 
 No browser pop-up at startup. Login happens on first use or via `/login codemie`.
@@ -70,28 +161,29 @@ pi --model codemie/claude-opus-4-6 "你好"
 
 | Command | Description |
 |---|---|
-| `/codemie-prices [input\|output\|total\|context] [asc\|desc]` | List CodeMie models with per-million-token input/output/cache-read/cache-write pricing, sorted by price (default: total cost ascending) or context window. |
-| `/codemie-usage` | Show current CodeMie account budget/quota usage (`GET {apiUrl}/v1/analytics/budget_usage`). |
+| `/codemie-prices [input\|output\|total\|context] [asc\|desc]` | List CodeMie models (same catalog for both `codemie` and `codemie-cli`) with per-million-token input/output/cache-read/cache-write pricing, sorted by price (default: total cost ascending) or context window. |
+| `/codemie-usage` | Show current CodeMie account budget/quota usage — all billing channels/rows (`GET {apiUrl}/v1/analytics/budget_usage`), plus a fast near-real-time CLI-channel summary (`GET {apiUrl}/v1/analytics/cli-summary`) and a link to the [full insights dashboard](https://codemie.lab.epam.com/analytics?tab=insights). |
 
-The footer/status bar also shows a compact live indicator (`💰 $spent/$limit (pct%)`), refreshed every 10 minutes. It sums the buckets pi's own requests actually charge (the plain account + `(premium)`); the `(cli)` bucket is excluded since it has been observed to always stay at $0 for pi/CodeMie-SSO usage. Note: `budget_usage` lags real spend by roughly 5-10 minutes (confirmed by timing real requests against repeated polls), so the indicator is not second-by-second live.
+The footer/status bar shows a compact live indicator per billing channel, refreshed every 10 minutes: `💰 $spent/$limit (pct%)` while a `codemie/*` model is active (sums every row except "(cli)"), and `🖥️ $spent/$limit (pct%)` while a `codemie-cli/*` model is active (sums only the "(cli)" row). Both read the same account's `budget_usage` response — they just report different buckets. Note: `budget_usage` lags real spend by roughly 5-10 minutes (confirmed by timing real requests against repeated polls), so the indicator is not second-by-second live.
 
-The indicator only shows while a `codemie/*` model is the active model — switching to another provider (via `/model`, `Ctrl+P` cycling, or session restore) hides it immediately, since the budget it reports is irrelevant to a non-CodeMie model. Switching back to a `codemie/*` model brings it back.
+Each indicator only shows while a model from its own provider is active — switching to the other provider (via `/model`, `Ctrl+P` cycling, or session restore) swaps which one is shown, since the budget it reports is only relevant to the currently active billing channel.
 
 ```bash
 /codemie-prices                # cheapest (input+output) first
 /codemie-prices output desc    # most expensive output price first
 /codemie-prices context desc   # largest context window first
 
-/codemie-usage                 # current account budget/quota usage
+/codemie-usage                 # current account budget/quota usage, all channels
 ```
 
 ## Provider
 
-Registers a single provider:
+Registers two providers, backed by the same credentials/session:
 
 | Provider ID | Description |
 |---|---|
-| `codemie` | All CodeMie-deployed models. Non-Claude via OpenAI Chat Completions (`/v1`), Claude via native Anthropic Messages (`/v1/messages`). |
+| `codemie` | All CodeMie-deployed models, using your own OAuth-SSO session (or `CODEMIE_*` env vars). Billed to the Web/Platform bucket. Non-Claude via OpenAI Chat Completions (`/v1`), Claude via native Anthropic Messages (`/v1/messages`). |
+| `codemie-cli` | Identical models/routing/credentials to `codemie`. Adds `X-CodeMie-Client`/`X-CodeMie-CLI`/`X-CodeMie-Project` (+ UUID Session-ID/Request-ID) headers — confirmed to bill usage to the "(cli)" bucket instead. See [Two billing channels, same account](#two-billing-channels-same-account-codemie-vs-codemie-cli). |
 
 ## Development
 
