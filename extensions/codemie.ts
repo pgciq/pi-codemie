@@ -21,6 +21,8 @@ import { createServer } from "node:http";
 import { execFile } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
+import { Markdown } from "@earendil-works/pi-tui";
 
 const AUTH_FILE = join(homedir(), ".pi", "agent", "auth.json");
 const COOKIE_FILE = join(homedir(), ".pi", "agent", "codemie-cookie.txt");
@@ -595,4 +597,351 @@ export default async function (pi) {
       models: routedModels,
     });
   }
+
+  registerPricesCommand(pi);
+  registerUsageCommand(pi, () => apiUrl, () => buildAuthHeaders());
+  registerUsageStatusBar(pi, () => apiUrl, () => buildAuthHeaders());
+
+  /** Headers for ad-hoc authenticated requests (usage/analytics), mirroring
+   * whichever auth mode is currently active. Re-read on every call so a
+   * post-login cookie refresh (persistSession) is picked up immediately. */
+  function buildAuthHeaders() {
+    if (envAuth?.headers) return { ...envAuth.headers };
+    if (envAuth?.apiKey) return { Authorization: `Bearer ${envAuth.apiKey}` };
+    const cookieString = process.env.CODEMIE_SESSION_COOKIE || "";
+    if (cookieString) return { Cookie: cookieString };
+    return {};
+  }
+}
+
+// ---------------------------------------------------------------------------
+// /codemie-prices — cost-sortable pricing table for CodeMie models
+// ---------------------------------------------------------------------------
+
+const SORT_KEYS = { input: "input", output: "output", total: "total", context: "contextWindow" };
+
+function fmtRate(n) {
+  if (!n) return "free";
+  return `$${n < 1 ? n.toFixed(3) : n.toFixed(2)}`;
+}
+
+function fmtSize(n) {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1000).toFixed(0)}K`;
+  return String(n);
+}
+
+function buildPricesMarkdown(models, sortKey, desc) {
+  const rows = models
+    .map((m) => ({
+      id: m.id,
+      input: m.cost?.input ?? 0,
+      output: m.cost?.output ?? 0,
+      cacheRead: m.cost?.cacheRead ?? 0,
+      cacheWrite: m.cost?.cacheWrite ?? 0,
+      total: (m.cost?.input ?? 0) + (m.cost?.output ?? 0),
+      contextWindow: m.contextWindow ?? 0,
+      maxTokens: m.maxTokens ?? 0,
+    }))
+    .sort((a, b) => (desc ? b[sortKey] - a[sortKey] : a[sortKey] - b[sortKey]));
+
+  const lines = [
+    `# CodeMie model prices (per 1M tokens, sorted by ${sortKey}${desc ? " desc" : " asc"})`,
+    "",
+    "| Model | Input | Output | Cache Read | Cache Write | Context | Max Out |",
+    "|---|---|---|---|---|---|---|",
+    ...rows.map(
+      (r) =>
+        `| ${r.id} | ${fmtRate(r.input)} | ${fmtRate(r.output)} | ${fmtRate(r.cacheRead)} | ${fmtRate(
+          r.cacheWrite
+        )} | ${fmtSize(r.contextWindow)} | ${fmtSize(r.maxTokens)} |`
+    ),
+  ];
+  return lines.join("\n");
+}
+
+function registerPricesCommand(pi) {
+  pi.registerCommand("codemie-prices", {
+    description:
+      "List CodeMie models sorted by price (input/output/total/context); e.g. /codemie-prices output desc",
+    getArgumentCompletions(prefix) {
+      const items = [
+        ...Object.keys(SORT_KEYS).map((k) => ({ value: k, label: k })),
+        { value: "asc", label: "asc" },
+        { value: "desc", label: "desc" },
+      ];
+      const filtered = items.filter((i) => i.value.startsWith(prefix));
+      return filtered.length > 0 ? filtered : null;
+    },
+    handler: async (args, ctx) => {
+      const tokens = (args || "").trim().split(/\s+/).filter(Boolean);
+      const sortArg = tokens.find((t) => t in SORT_KEYS) || "total";
+      const desc = tokens.includes("desc");
+      const sortKey = SORT_KEYS[sortArg];
+
+      const models = ctx.modelRegistry.getAvailable().filter((m) => m.provider === "codemie");
+      if (models.length === 0) {
+        notifyOrPrint(ctx, "No CodeMie models available (not authenticated yet?).");
+        return;
+      }
+
+      const markdown = buildPricesMarkdown(models, sortKey, desc);
+
+      if (ctx.mode === "tui") {
+        pi.appendEntry("codemie-prices", { markdown });
+      } else if (ctx.hasUI) {
+        ctx.ui.notify(markdown, "info");
+      } else {
+        // print/json modes: notify() is a no-op (ctx.hasUI === false) — write directly.
+        console.log(markdown);
+      }
+    },
+  });
+
+  pi.registerEntryRenderer("codemie-prices", (entry) => {
+    const data = entry.data;
+    const mdTheme = getMarkdownTheme();
+    return new Markdown(data.markdown, 1, 0, mdTheme);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// /codemie-usage — account budget/quota usage
+// (confirmed endpoint, captured from the CodeMie web UI's Network panel:
+//  GET {apiUrl}/v1/analytics/budget_usage)
+// ---------------------------------------------------------------------------
+
+async function fetchBudgetUsage(apiUrl, headers) {
+  const res = await fetch(`${apiUrl.replace(/\/+$/, "")}/v1/analytics/budget_usage`, {
+    headers,
+    redirect: "follow",
+  });
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status} ${res.statusText}`);
+  }
+  return res.json();
+}
+
+/** notify() is a no-op outside TUI/RPC (ctx.hasUI === false in print/json) — fall
+ * back to stdout so print-mode/CI callers still see the message. */
+function notifyOrPrint(ctx, message, level = "warning") {
+  if (ctx.hasUI) ctx.ui.notify(message, level);
+  else console.log(message);
+}
+
+function fmtMoney(n) {
+  return typeof n === "number" && Number.isFinite(n) ? `$${n.toFixed(2)}` : String(n ?? "");
+}
+
+function fmtPercent(n) {
+  return typeof n === "number" && Number.isFinite(n) ? `${n.toFixed(1)}%` : String(n ?? "");
+}
+
+function fmtTimestamp(iso) {
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return String(iso ?? "");
+  return new Date(t).toISOString().replace("T", " ").replace(/\.\d+Z$/, " UTC");
+}
+
+/** Render an unknown JSON shape as markdown without assuming its schema:
+ * a flat array of objects becomes a table, a plain object becomes a
+ * key/value list, anything else is pretty-printed as a JSON code block. */
+function buildGenericMarkdown(data) {
+  const lines = ["# CodeMie budget usage", ""];
+
+  if (Array.isArray(data) && data.length > 0 && data.every((row) => row && typeof row === "object")) {
+    const keys = Array.from(new Set(data.flatMap((row) => Object.keys(row))));
+    lines.push(`| ${keys.join(" | ")} |`);
+    lines.push(`|${keys.map(() => "---").join("|")}|`);
+    for (const row of data) {
+      lines.push(`| ${keys.map((k) => String(row[k] ?? "")).join(" | ")} |`);
+    }
+    return lines.join("\n");
+  }
+
+  if (data && typeof data === "object" && !Array.isArray(data)) {
+    lines.push("| Field | Value |", "|---|---|");
+    for (const [key, value] of Object.entries(data)) {
+      const rendered =
+        value && typeof value === "object" ? "```json\n" + JSON.stringify(value, null, 2) + "\n```" : String(value);
+      lines.push(`| ${key} | ${rendered} |`);
+    }
+    return lines.join("\n");
+  }
+
+  lines.push("```json", JSON.stringify(data, null, 2), "```");
+  return lines.join("\n");
+}
+
+/**
+ * `/v1/analytics/budget_usage` returns `{ data: { columns, rows, totals }, metadata }`
+ * (a generic "report table" shape). Render the known `rows` fields
+ * (project_name, current_spending, budget_limit, total%, budget_reset_at,
+ * time_until_reset) as a friendly table; fall back to the generic renderer
+ * for anything that doesn't match this exact shape.
+ */
+function buildUsageMarkdown(payload) {
+  const rows = payload?.data?.rows;
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return buildGenericMarkdown(payload);
+  }
+
+  const asOf = payload?.metadata?.data_as_of;
+  const lines = [
+    "# CodeMie budget usage",
+    "",
+    asOf ? `_as of ${fmtTimestamp(asOf)}_` : undefined,
+    "_(budget_usage lags real spend by ~5-10 min; \"(cli)\" bucket excluded from the status-bar total — observed to never be charged by pi.)_",
+    "",
+    "| Project | Spent | Budget Limit | Used % | Resets At | Time Until Reset |",
+    "|---|---|---|---|---|---|",
+    ...rows.map((r) =>
+      `| ${r.project_name ?? ""} | ${fmtMoney(r.current_spending)} | ${fmtMoney(r.budget_limit)} | ${fmtPercent(
+        r.total
+      )} | ${fmtTimestamp(r.budget_reset_at)} | ${r.time_until_reset ?? ""} |`
+    ),
+  ].filter((l) => l !== undefined);
+
+  return lines.join("\n");
+}
+
+function registerUsageCommand(pi, getApiUrl, getAuthHeaders) {
+  pi.registerCommand("codemie-usage", {
+    description: "Show current CodeMie account budget/quota usage.",
+    handler: async (_args, ctx) => {
+      const apiUrl = getApiUrl();
+      const headers = getAuthHeaders();
+      if (!apiUrl || Object.keys(headers).length === 0) {
+        notifyOrPrint(ctx, "Not authenticated with CodeMie yet — run /login codemie first.");
+        return;
+      }
+      let data;
+      try {
+        data = await fetchBudgetUsage(apiUrl, headers);
+      } catch (error) {
+        notifyOrPrint(
+          ctx,
+          `Failed to fetch CodeMie budget usage (${error instanceof Error ? error.message : String(error)}).`
+        );
+        return;
+      }
+
+      const markdown = buildUsageMarkdown(data);
+      if (ctx.mode === "tui") {
+        pi.appendEntry("codemie-usage", { markdown });
+      } else if (ctx.hasUI) {
+        ctx.ui.notify(markdown, "info");
+      } else {
+        // print/json modes: notify() is a no-op (ctx.hasUI === false) — write directly.
+        console.log(markdown);
+      }
+    },
+  });
+
+  pi.registerEntryRenderer("codemie-usage", (entry) => {
+    const data = entry.data;
+    const mdTheme = getMarkdownTheme();
+    return new Markdown(data.markdown, 1, 0, mdTheme);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Status bar — compact budget usage, refreshed periodically + after turns
+// ---------------------------------------------------------------------------
+
+const USAGE_STATUS_KEY = "codemie-usage";
+// The backend aggregates spend in batches — measured ~5-10 min lag between an
+// actual request and budget_usage reflecting it (confirmed empirically: cost
+// showed up in the API response immediately, but budget_usage stayed frozen
+// for 3+ minutes before updating). Polling more often than that just wastes
+// requests, so there is no turn_end-triggered refresh — background poll only.
+const USAGE_REFRESH_INTERVAL_MS = 10 * 60 * 1000;
+
+// Buckets actually charged by pi/CodeMie API usage. The "(cli)" bucket has
+// been observed to stay at $0 across real usage — it appears to be reserved
+// for a different auth path (CodeMie's own CLI with a dedicated API key) and
+// including its budget_limit in the denominator would understate the real
+// usage percentage. Only sum buckets whose project_name does NOT end in
+// "(cli)".
+function isCliBucket(projectName) {
+  return typeof projectName === "string" && /\(cli\)\s*$/i.test(projectName);
+}
+
+/** Aggregate the buckets that pi's own requests actually charge (main +
+ * premium, excluding the always-$0 "(cli)" bucket) into one compact line. */
+function summarizeUsage(payload, theme) {
+  const rows = payload?.data?.rows;
+  if (!Array.isArray(rows) || rows.length === 0) return undefined;
+
+  const relevant = rows.filter((r) => !isCliBucket(r.project_name));
+  const usedRows = relevant.length > 0 ? relevant : rows;
+
+  const spent = usedRows.reduce((s, r) => s + (typeof r.current_spending === "number" ? r.current_spending : 0), 0);
+  const limit = usedRows.reduce((s, r) => s + (typeof r.budget_limit === "number" ? r.budget_limit : 0), 0);
+  const pct = limit > 0 ? (spent / limit) * 100 : 0;
+
+  const color = pct >= 90 ? "error" : pct >= 70 ? "warning" : "dim";
+  const text = `💰 $${spent.toFixed(2)}/$${limit.toFixed(2)} (${pct.toFixed(1)}%)`;
+  return theme ? theme.fg(color, text) : text;
+}
+
+function isCodemieModel(model) {
+  return model?.provider === "codemie";
+}
+
+function registerUsageStatusBar(pi, getApiUrl, getAuthHeaders) {
+  let timer;
+  let inFlight = false;
+  // Only show/refresh the widget while a codemie/* model is actually active —
+  // switching to another provider (e.g. anthropic/openai/opencode) hides it,
+  // since the budget it reports is irrelevant to whatever model is now
+  // active. Switching back to a codemie/* model brings it back.
+  let active = false;
+
+  async function refresh(ctx) {
+    if (!active || inFlight) return;
+
+    const apiUrl = getApiUrl();
+    const headers = getAuthHeaders();
+    if (!apiUrl || Object.keys(headers).length === 0) return; // not authenticated yet
+
+    inFlight = true;
+    try {
+      const payload = await fetchBudgetUsage(apiUrl, headers);
+      const summary = summarizeUsage(payload, ctx.ui.theme);
+      if (summary) ctx.ui.setStatus(USAGE_STATUS_KEY, summary);
+    } catch {
+      // Best-effort background refresh — keep whatever status was shown before.
+    } finally {
+      inFlight = false;
+    }
+  }
+
+  function setActive(nowActive, ctx) {
+    if (active === nowActive) return;
+    active = nowActive;
+    if (active) {
+      refresh(ctx);
+    } else {
+      ctx.ui.setStatus(USAGE_STATUS_KEY, undefined);
+    }
+  }
+
+  pi.on("session_start", async (_event, ctx) => {
+    active = isCodemieModel(ctx.model);
+    if (active) refresh(ctx);
+    if (timer) clearInterval(timer);
+    timer = setInterval(() => refresh(ctx), USAGE_REFRESH_INTERVAL_MS);
+  });
+
+  pi.on("model_select", async (event, ctx) => {
+    setActive(isCodemieModel(event.model), ctx);
+  });
+
+  pi.on("session_shutdown", async () => {
+    if (timer) {
+      clearInterval(timer);
+      timer = undefined;
+    }
+  });
 }
