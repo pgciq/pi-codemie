@@ -193,6 +193,15 @@ pi --model codemie/gpt-5.1-codex "hello"
 
 Credentials persist in `~/.pi/agent/auth.json`. Expired sessions are refreshed automatically.
 
+## Model discovery (non-blocking)
+
+`pi-codemie` registers a **seed** model list synchronously at load (so pi starts instantly) and discovers the full deployed catalog **in the background** after startup — it never blocks on `GET {apiUrl}/v1/llm_models` or the `/v1/user` project lookup.
+
+- The seed list is always available immediately, even with no credentials or offline.
+- Background discovery fetches the live `llm_models` catalog and resolves the billing project (`X-CodeMie-Project`) from `/v1/user`; both calls are bounded by an 8s timeout and fall back to the seed list on any failure.
+- The discovered catalog is cached to `~/.pi/cache/codemie-models.json` (24h TTL, keyed by API URL) so subsequent starts work offline; a stale/missing cache falls back to the seed list.
+- Both `codemie` and `codemie-cli` providers are hot-re-registered with the discovered catalog (same credentials, different billing-channel headers).
+
 ## Usage
 
 ```bash
