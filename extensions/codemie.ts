@@ -245,30 +245,25 @@ function convertLlmModel(model) {
   }
 
   // Surface the deployment's real capabilities so Pi (and /codemie-capabilities)
-  // reflects vision (multimodal), image/video/audio generation, and tools.
-  // CodeMie's model item may carry type/capabilities/supported_features; read
-  // them defensively (absent fields simply stay false).
-  const cmCaps = model.capabilities ?? {};
-  const cmFeats = Array.isArray(model.supported_features)
-    ? model.supported_features
-    : Array.isArray(model.features)
-      ? model.features
-      : [];
-  const cmType = String(model.type ?? model.model_type ?? "").toLowerCase();
-  const cmHas = (...names: string[]) =>
-    names.some(
-      (n) =>
-        cmType === n ||
-        cmFeats.includes(n) ||
-        cmCaps?.[n] === true ||
-        (Array.isArray(cmCaps?.[n]) && cmCaps[n].length > 0),
-    );
+  // reflects what CodeMie actually reports. The live `GET /v1/llm_models`
+  // schema (confirmed against the official codemie-code client + a live
+  // probe of this account) exposes per model:
+  //   multimodal                 -> vision (image INPUT)
+  //   supports_image_generation  -> image *generation* (a few models only)
+  //   features.tools             -> function/tool calling (`features` is an
+  //                                 OBJECT, not an array: {tools, streaming,
+  //                                 parallel_tool_calls, ...})
+  // There is NO video/audio-generation field in CodeMie's schema, so those
+  // capability flags stay false. (Image generation is flagged here, but this
+  // extension does not yet route generation requests to a CodeMie image
+  // endpoint — that endpoint is not yet verified.)
+  const cmFeatures = model.features ?? {};
   entry.capabilities = {
-    tools: true,
+    tools: cmFeatures.tools === true,
     vision: !!model.multimodal,
-    image: cmHas("image") || cmType === "image",
-    video: cmHas("video") || cmType === "video",
-    audio: cmHas("audio") || cmType === "audio",
+    image: model.supports_image_generation === true,
+    video: false,
+    audio: false,
     reasoning: entry.reasoning,
   };
 

@@ -202,6 +202,18 @@ Credentials persist in `~/.pi/agent/auth.json`. Expired sessions are refreshed a
 - The discovered catalog is cached to `~/.pi/cache/codemie-models.json` (24h TTL, keyed by API URL) so subsequent starts work offline; a stale/missing cache falls back to the seed list.
 - Both `codemie` and `codemie-cli` providers are hot-re-registered with the discovered catalog (same credentials, different billing-channel headers).
 
+## Per-model capabilities (vision / image / tools / reasoning)
+
+Each model is registered with capabilities read from CodeMie's real `GET /v1/llm_models` schema (confirmed against the official `codemie-code` client and a live probe):
+
+- `vision` ← `multimodal` (image **input**). Most chat deployments report `multimodal: true`.
+- `image` (generation) ← `supports_image_generation` (a **few** models only; the rest are `false`).
+- `tools` ← `features.tools` (function/tool calling). `features` is an **object** (`{ tools, streaming, parallel_tool_calls, … }`), not an array.
+- `reasoning` ← derived from the model id (claude / gpt-5 / o1 / deepseek / kimi / …).
+- `video` / `audio` ← **not exposed by CodeMie's schema**, so they always stay `false`.
+
+`/codemie-capabilities` shows these per deployment. Image-generation is **flagged** here, but this extension does not yet route generation requests to a CodeMie image endpoint — that endpoint is not yet verified, so selecting an image-generation model returns a clear “not streamed by this extension” error rather than a 404.
+
 ## Usage
 
 ```bash
@@ -219,7 +231,7 @@ pi --model codemie/claude-opus-4-6 "你好"
 | Command | Description |
 |---|---|
 | `/codemie-prices [input\|output\|total\|context] [asc\|desc]` | List CodeMie models (same catalog for both `codemie` and `codemie-cli`) with per-million-token input/output/cache-read/cache-write pricing, sorted by price (default: total cost ascending) or context window. |
-| `/codemie-capabilities [image\|video\|audio\|vision\|reasoning\|tools]` | List each CodeMie deployment's capabilities (vision / image / video / audio / tools / reasoning) read from its model metadata; an optional filter narrows the table to deployments that support that capability. |
+| `/codemie-capabilities [image\|video\|audio\|vision\|reasoning\|tools]` | List each CodeMie deployment's capabilities (vision via `multimodal`, image generation via `supports_image_generation`, tools via `features.tools`, reasoning via model id; video/audio are not exposed by CodeMie so always `—`); an optional filter narrows the table to deployments that support that capability. |
 | `/codemie-usage` | Show current CodeMie account budget/quota usage — all billing channels/rows (`GET {apiUrl}/v1/analytics/budget_usage`), plus a fast near-real-time CLI-channel summary (`GET {apiUrl}/v1/analytics/cli-summary`) and a link to the [full insights dashboard](https://codemie.lab.epam.com/analytics?tab=insights). |
 
 The footer/status bar shows a compact live indicator per billing channel, refreshed every 10 minutes: `💰 $spent/$limit (pct%)` while a `codemie/*` model is active (sums every row except "(cli)"), and `🖥️ $spent/$limit (pct%)` while a `codemie-cli/*` model is active (sums only the "(cli)" row). Both read the same account's `budget_usage` response — they just report different buckets. Note: `budget_usage` lags real spend by roughly 5-10 minutes (confirmed by timing real requests against repeated polls), so the indicator is not second-by-second live.
