@@ -219,6 +219,7 @@ pi --model codemie/claude-opus-4-6 "你好"
 | Command | Description |
 |---|---|
 | `/codemie-prices [input\|output\|total\|context] [asc\|desc]` | List CodeMie models (same catalog for both `codemie` and `codemie-cli`) with per-million-token input/output/cache-read/cache-write pricing, sorted by price (default: total cost ascending) or context window. |
+| `/codemie-capabilities [image\|video\|audio\|vision\|reasoning\|tools]` | List each CodeMie deployment's capabilities (vision / image / video / audio / tools / reasoning) read from its model metadata; an optional filter narrows the table to deployments that support that capability. |
 | `/codemie-usage` | Show current CodeMie account budget/quota usage — all billing channels/rows (`GET {apiUrl}/v1/analytics/budget_usage`), plus a fast near-real-time CLI-channel summary (`GET {apiUrl}/v1/analytics/cli-summary`) and a link to the [full insights dashboard](https://codemie.lab.epam.com/analytics?tab=insights). |
 
 The footer/status bar shows a compact live indicator per billing channel, refreshed every 10 minutes: `💰 $spent/$limit (pct%)` while a `codemie/*` model is active (sums every row except "(cli)"), and `🖥️ $spent/$limit (pct%)` while a `codemie-cli/*` model is active (sums only the "(cli)" row). Both read the same account's `budget_usage` response — they just report different buckets. Note: `budget_usage` lags real spend by roughly 5-10 minutes (confirmed by timing real requests against repeated polls), so the indicator is not second-by-second live.
@@ -229,6 +230,7 @@ Each indicator only shows while a model from its own provider is active — swit
 /codemie-prices                # cheapest (input+output) first
 /codemie-prices output desc    # most expensive output price first
 /codemie-prices context desc   # largest context window first
+/codemie-capabilities image   # only image-generation deployments
 
 /codemie-usage                 # current account budget/quota usage, all channels
 ```

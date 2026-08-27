@@ -244,6 +244,34 @@ function convertLlmModel(model) {
     entry.compat = { forceAdaptiveThinking: true };
   }
 
+  // Surface the deployment's real capabilities so Pi (and /codemie-capabilities)
+  // reflects vision (multimodal), image/video/audio generation, and tools.
+  // CodeMie's model item may carry type/capabilities/supported_features; read
+  // them defensively (absent fields simply stay false).
+  const cmCaps = model.capabilities ?? {};
+  const cmFeats = Array.isArray(model.supported_features)
+    ? model.supported_features
+    : Array.isArray(model.features)
+      ? model.features
+      : [];
+  const cmType = String(model.type ?? model.model_type ?? "").toLowerCase();
+  const cmHas = (...names: string[]) =>
+    names.some(
+      (n) =>
+        cmType === n ||
+        cmFeats.includes(n) ||
+        cmCaps?.[n] === true ||
+        (Array.isArray(cmCaps?.[n]) && cmCaps[n].length > 0),
+    );
+  entry.capabilities = {
+    tools: true,
+    vision: !!model.multimodal,
+    image: cmHas("image") || cmType === "image",
+    video: cmHas("video") || cmType === "video",
+    audio: cmHas("audio") || cmType === "audio",
+    reasoning: entry.reasoning,
+  };
+
   return entry;
 }
 
@@ -724,6 +752,7 @@ export default function (pi) {
 
   // ---- Commands & status bar (unchanged) ----------------------------------
   registerPricesCommand(pi);
+  registerCapabilitiesCommand(pi);
   registerUsageCommand(pi, () => apiUrl, () => buildAuthHeaders());
   // Both status widgets read the SAME account's budget_usage response (one
   // account, multiple buckets) — they differ only in which row(s) they sum:
@@ -867,6 +896,74 @@ function registerPricesCommand(pi) {
     const data = entry.data;
     const mdTheme = getMarkdownTheme();
     return new Markdown(data.markdown, 1, 0, mdTheme);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// /codemie-capabilities — per-deployment capability table
+// ---------------------------------------------------------------------------
+
+function registerCapabilitiesCommand(pi) {
+  const flags = {
+    reasoning: "reasoning",
+    vision: "vision",
+    image: "image",
+    video: "video",
+    audio: "audio",
+    tools: "tools",
+  };
+
+  pi.registerCommand("codemie-capabilities", {
+    description:
+      "List CodeMie deployment capabilities (vision/image/video/audio/tools/reasoning); e.g. /codemie-capabilities image",
+    handler: async (args, ctx) => {
+      const tokens = (args || "").trim().split(/\s+/).filter(Boolean);
+      const filter = tokens.find((token) => token in flags);
+      const models = ctx.modelRegistry.getAvailable().filter((m) => m.provider === "codemie" || m.provider === "codemie-cli");
+
+      const rows = models
+        .map((model) => {
+          const caps = model.capabilities ?? {};
+          return {
+            id: model.id,
+            type: model.id.startsWith("claude") ? "claude" : "chat",
+            reasoning: caps.reasoning ? "✓" : "",
+            vision: caps.vision ? "✓" : "",
+            image: caps.image ? "✓" : "",
+            video: caps.video ? "✓" : "",
+            audio: caps.audio ? "✓" : "",
+            tools: caps.tools ? "✓" : "",
+          };
+        })
+        .filter((row) => !filter || row[flags[filter]] === "✓")
+        .sort((a, b) => (a.type === b.type ? a.id.localeCompare(b.id) : a.type.localeCompare(b.type)));
+
+      const markdown = [
+        `# CodeMie deployment capabilities${filter ? ` (filter: ${filter})` : ""}`,
+        "",
+        "| Model | Type | Reasoning | Vision | Image | Video | Audio | Tools |",
+        "|---|---|:---:|:---:|:---:|:---:|:---:|:---:|",
+        ...rows.map(
+          (row) =>
+            `| ${row.id} | ${row.type} | ${row.reasoning || "—"} | ${row.vision || "—"} | ${row.image || "—"} | ${row.video || "—"} | ${row.audio || "—"} | ${row.tools || "—"} |`,
+        ),
+        "",
+        "_Capabilities are read from each deployment's CodeMie model metadata (multimodal / type / capabilities / supported_features)._",
+      ].join("\n");
+
+      if (ctx.mode === "tui") {
+        pi.appendEntry("codemie-capabilities", { markdown });
+      } else if (ctx.hasUI) {
+        ctx.ui.notify(markdown, "info");
+      } else {
+        console.log(markdown);
+      }
+    },
+  });
+
+  pi.registerEntryRenderer("codemie-capabilities", (entry) => {
+    const mdTheme = getMarkdownTheme();
+    return new Markdown(entry.data.markdown, 1, 0, mdTheme);
   });
 }
 
