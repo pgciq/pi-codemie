@@ -36,6 +36,19 @@
 //   codemie-cli  – identical models/routing/credentials, billed to the "(cli)"
 //                  bucket via X-CodeMie-Client/X-CodeMie-CLI/X-CodeMie-Project
 //                  (+ valid-UUID Session-ID/Request-ID) headers.
+//
+// Orphaned spend if X-CodeMie-Project is missing/unresolvable (e.g. the
+// /v1/user lookup fails at startup): CONFIRMED that such requests still
+// spend real money — they increment the account-wide
+// `GET /v1/analytics/summaries` totals (`total_money_spent`, `cli_cost`) —
+// but do NOT appear in ANY `/v1/analytics/budget_usage` row (not plain, not
+// "(cli)", not "(premium)"). This is why `/codemie-usage` also queries the
+// faster `cli-summary` endpoint: as a cross-check for spend that budget_usage
+// can't attribute to a project. Whether an enforced $ cap still applies to
+// this unattributed spend is UNCONFIRMED — deliberately exhausting a budget
+// just to observe the error response was judged too risky to test against a
+// real account. Do not treat this as a documented/supported way to dodge
+// budget limits.
 
 import { existsSync, readFileSync, writeFileSync, chmodSync } from "node:fs";
 import { createServer } from "node:http";
@@ -700,8 +713,23 @@ export default async function (pi) {
   // gateway can attribute spend to `<project> (cli)`. Uses the exact same
   // credentials as `codemie` (cookie or Bearer, whichever is active) — no
   // extra login. If this fails (offline, stale session, etc.), `codemie-cli`
-  // still registers without `X-CodeMie-Project` and falls back to behaving
-  // like `codemie` (billed to the plain bucket) until the next restart.
+  // registers WITHOUT `X-CodeMie-Project`.
+  //
+  // CONFIRMED (2026-08-27, before/after `GET /v1/analytics/summaries` and
+  // `/v1/analytics/budget_usage`): this does NOT fall back to the plain
+  // Web/Platform bucket as previously assumed. Requests missing
+  // `X-CodeMie-Project` still increment the account-wide
+  // `summaries.total_money_spent` / `summaries.cli_cost` (i.e. real money is
+  // spent and it IS counted), but they do not appear in ANY row of
+  // `budget_usage` — not plain, not "(cli)", not "(premium)". The spend
+  // becomes invisible to `/codemie-usage` specifically, not to billing. This
+  // is the reason `/codemie-usage` now also calls `cli-summary` (see below)
+  // as a cross-check for this exact orphaned-spend scenario. Whether an
+  // *enforced dollar cap* still applies to this unattributed spend is
+  // unconfirmed — not tested, since deliberately exhausting a budget purely
+  // to observe the error response is too risky to try against a real
+  // account. Do not rely on omitting this header as a way around the
+  // "(cli)"/plain budget limits.
   let cliProject;
   try {
     const cookies = oauthCreds ? cookieStringFromCredential(oauthCreds) : "";
@@ -713,7 +741,8 @@ export default async function (pi) {
     console.error(
       `[codemie-cli] Could not resolve account project for X-CodeMie-Project (${
         error instanceof Error ? error.message : String(error)
-      }); "(cli)" bucket attribution may not work until next restart.`
+      }); usage until next restart will still be billed for real but will NOT ` +
+        `show up in any /codemie-usage row (see summaries.total_money_spent instead).`
     );
   }
   if (cliProject) cliChannelHeaders["X-CodeMie-Project"] = cliProject;

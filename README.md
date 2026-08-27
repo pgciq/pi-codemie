@@ -88,10 +88,52 @@ pi --model codemie-cli/gpt-5.1-codex "..."  # billed to the "(cli)" bucket — s
 ```
 
 If the `/v1/user` lookup fails at startup (offline, stale session, etc.),
-`codemie-cli` still registers without `X-CodeMie-Project` and falls back to
-behaving like `codemie` (billed to the plain bucket) until the next restart—
-check the startup log for a `[codemie-cli] Could not resolve account project`
-warning if `/codemie-usage` shows spend landing in the wrong bucket.
+`codemie-cli` still registers without `X-CodeMie-Project` — check the startup
+log for a `[codemie-cli] Could not resolve account project` warning. **This
+does NOT fall back to billing the plain bucket** (see below for what actually
+happens, confirmed 2026-08-27).
+
+#### What happens without `X-CodeMie-Project`: orphaned spend, not free spend
+
+Omitting `X-CodeMie-Project` (deliberately, or via the startup-lookup-failure
+path above) does **not** make requests free, and does **not** route them back
+to the plain Web/Platform bucket. Confirmed with a before/after comparison
+across 4 real requests, same session, headers identical except for a missing
+`X-CodeMie-Project`:
+
+| Source | Before | After 4 requests | Moved? |
+|---|---|---|---|
+| `budget_usage` — plain row | $14.97 | $14.97 | no |
+| `budget_usage` — "(cli)" row | $0.27 | $0.27 | no |
+| `budget_usage` — "(premium)" row | $0.13 | $0.13 | no |
+| `summaries.total_money_spent` | $27.89 | $27.91 | **yes, +$0.02** |
+| `summaries.cli_cost` | $0.27 | $0.29 | **yes, +$0.02 (matches total exactly)** |
+| `summaries.cli_invoked` | 910 | 914 | **yes, +4 (exactly our request count)** |
+
+So the spend is real and it **is** counted — in the account-wide
+`GET /v1/analytics/summaries` totals (the same numbers behind the
+[analytics dashboard](https://codemie.lab.epam.com/analytics?tab=insights)'s
+"Summary Metrics" → "Total Money Spent" card) — but it never lands in any
+row of `budget_usage`, i.e. it's invisible to `/codemie-usage` specifically,
+not to billing. This is exactly why `/codemie-usage` also calls `cli-summary`
+(see below): as a cross-check that can surface this kind of orphaned spend
+that the budget table alone would miss.
+
+**Does an enforced $ cap still apply to this unattributed spend?** Unconfirmed
+by design — answering that for certain would require deliberately exhausting
+a real budget to observe the error response, which felt too risky to test
+against a live account. What we know: LiteLLM (which CodeMie's gateway is
+built on) enforces per-request budget checks against whichever `customer_id`/
+`team_id` a request resolves to; without `X-CodeMie-Project` a request likely
+resolves to no customer object (or a different, unmanaged one), which would
+mean it's checked against the parent API key's budget instead of any of your
+three personal buckets — that key's budget, if any, is not something this
+extension has visibility into. Treat this as an open question, not a
+confirmed bypass: **don't rely on omitting `X-CodeMie-Project` as a way to get
+around the "(cli)"/plain/premium budget limits** — it's undocumented
+behavior on CodeMie's backend that could be tightened at any time, and
+`codemie-cli` only ever omits it by accident (a failed `/v1/user` lookup), not
+by design.
 
 #### Faster verification: the analytics insights endpoints
 
@@ -110,6 +152,12 @@ for CLI-proxy traffic specifically, i.e. requests carrying `X-CodeMie-Client`
 like `codemie-cli`'s — it won't move for plain `codemie` usage) plus a direct
 link to the full dashboard. If that fetch fails (network hiccup, etc.),
 `/codemie-usage` still shows the budget table and just the dashboard link.
+
+This is also the practical reason this section exists at all: it's the
+only place `/codemie-usage` can surface the "orphaned spend" scenario
+described above (requests missing `X-CodeMie-Project`, which never show up
+in any `budget_usage` row). `summaries`/`cli-summary`'s totals still catch
+that spend even when the per-project budget table can't attribute it.
 
 For a deeper per-client breakdown than the command surfaces, query the
 endpoints directly with the same session cookie `codemie-cli` uses:
