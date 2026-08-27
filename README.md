@@ -212,7 +212,7 @@ Each model is registered with capabilities read from CodeMie's real `GET /v1/llm
 - `reasoning` ← derived from the model id (claude / gpt-5 / o1 / deepseek / kimi / …).
 - `video` / `audio` ← **not exposed by CodeMie's schema**, so they always stay `false`.
 
-`/codemie-capabilities` shows these per deployment. Image-generation is **flagged** here, but this extension does not yet route generation requests to a CodeMie image endpoint — that endpoint is not yet verified, so selecting an image-generation model returns a clear “not streamed by this extension” error rather than a 404.
+`/codemie-capabilities` shows these per deployment. Image generation is **performed through the standard chat/completions endpoint** with an image-capable model (e.g. `gemini-3.1-flash-image`): the model returns the generated image(s) inline in `message.images[]` (verified live — a real base64 PNG came back). There is **no separate `/images/generations` endpoint** on CodeMie — every such path 404s, and `GET /v1/llm_models/image_generation` only *lists* which models support it. Because image generation rides the normal OpenAI Chat Completions path that this extension already routes to, no special routing is needed; the `image` capability flag simply marks those models so `/codemie-capabilities image` lists them. Whether pi renders the returned `message.images` to you is a pi-core (OpenAI adapter) concern, not this extension.
 
 ## Usage
 
