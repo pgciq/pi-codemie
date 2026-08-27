@@ -50,7 +50,7 @@
 // real account. Do not treat this as a documented/supported way to dodge
 // budget limits.
 
-import { existsSync, readFileSync, writeFileSync, chmodSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, chmodSync, mkdirSync } from "node:fs";
 import { createServer } from "node:http";
 import { execFile } from "node:child_process";
 import { homedir } from "node:os";
@@ -67,6 +67,60 @@ const PROVIDER_IDS = ["codemie", "codemie-cli"];
 const LOGIN_TIMEOUT_MS = 120_000;
 // Default CodeMie instance — override with CODEMIE_BASE_URL.
 const DEFAULT_CODEMIE_URL = "https://codemie.lab.epam.com";
+// Bound every CodeMie discovery/lookup request so a slow or hung endpoint can
+// never stall the (now background) model discovery indefinitely.
+const CODIEMIE_FETCH_TIMEOUT_MS = 8_000;
+
+// Merge an optional external abort signal with a hard per-call timeout.
+const CODIEME_FETCH_TIMEOUT_MS = 8_000;
+
+function withTimeout(signal, ms) {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), ms);
+  const clear = () => clearTimeout(timer);
+  ac.signal.addEventListener("abort", clear, { once: true });
+  if (signal) {
+    if (signal.aborted) ac.abort();
+    else signal.addEventListener("abort", () => ac.abort(), { once: true });
+  }
+  return ac.signal;
+}
+
+// Persisted model-discovery cache so an offline/flaky start still registers the
+// last-known-good catalog (not just the hardcoded seed list). Keyed by API base
+// URL because CodeMie models are instance-specific (CODEMIE_BASE_URL / stored
+// SSO session).
+const CACHE_DIR = join(homedir(), ".pi", "cache");
+const CACHE_FILE = join(CACHE_DIR, "codemie-models.json");
+const CACHE_TTL = 24 * 60 * 60 * 1000; // 24h
+
+function loadCache(apiUrl) {
+  try {
+    if (!existsSync(CACHE_FILE)) return null;
+    const data = JSON.parse(readFileSync(CACHE_FILE, "utf-8"));
+    const entry = data?.urls?.[apiUrl];
+    if (!entry || typeof entry.timestamp !== "number") return null;
+    if (Date.now() - entry.timestamp > CACHE_TTL) return null;
+    return entry; // { models, cliProject }
+  } catch {
+    return null;
+  }
+}
+
+function saveCache(apiUrl, models, cliProject) {
+  try {
+    let data = {};
+    if (existsSync(CACHE_FILE)) {
+      try { data = JSON.parse(readFileSync(CACHE_FILE, "utf-8")); } catch { /* ignore */ }
+    }
+    data.urls = data.urls ?? {};
+    data.urls[apiUrl] = { timestamp: Date.now(), models, cliProject };
+    if (!existsSync(CACHE_DIR)) mkdirSync(CACHE_DIR, { recursive: true });
+    writeFileSync(CACHE_FILE, JSON.stringify(data));
+  } catch {
+    // best-effort; the cache is an optimization, never required
+  }
+}
 
 /**
  * Normalize a CodeMie URL to the API base, exactly like codemie-code's
@@ -422,6 +476,7 @@ async function fetchCodeMieModels(apiUrl, { bearer, cookieString }) {
   const res = await fetch(`${apiUrl.replace(/\/+$/, "")}/v1/llm_models?include_all=true`, {
     headers,
     redirect: "follow",
+    signal: withTimeout(undefined, CODIEME_FETCH_TIMEOUT_MS),
   });
   if (!res.ok) {
     throw new Error(`HTTP ${res.status} ${res.statusText}`);
@@ -430,7 +485,10 @@ async function fetchCodeMieModels(apiUrl, { bearer, cookieString }) {
   if (!Array.isArray(models)) {
     throw new Error("unexpected response shape (expected array)");
   }
-  return models.filter((m) => m && m.enabled !== false).map(convertLlmModel);
+  return models
+    .filter((m) => m && m.enabled !== false)
+    .map(convertLlmModel)
+    .filter((m) => m && m.id);
 }
 
 /**
@@ -448,6 +506,7 @@ async function fetchCodeMieProject(apiUrl, { bearer, cookieString }) {
   const res = await fetch(`${apiUrl.replace(/\/+$/, "")}/v1/user`, {
     headers,
     redirect: "follow",
+    signal: withTimeout(undefined, CODIEME_FETCH_TIMEOUT_MS),
   });
   if (!res.ok) {
     throw new Error(`HTTP ${res.status} ${res.statusText}`);
@@ -496,7 +555,7 @@ function seedModels() {
 // Extension entry point
 // ---------------------------------------------------------------------------
 
-export default async function (pi) {
+export default function (pi) {
   // Accept either https://host or https://host/code-assistant-api — normalize
   // to the API base like the CodeMie CLI does. Defaults to the public EPAM lab
   // instance when CODEMIE_BASE_URL is not set.
@@ -510,40 +569,21 @@ export default async function (pi) {
   const cookieEnv = process.env.CODEMIE_COOKIE || "";
 
   let apiUrl = codeMieUrl;
-  let entries = [];
   let envAuth = null; // { headers } | { apiKey, authHeader? }
 
   if (codeMieUrl && (jwt || apiKeyEnv || cookieEnv)) {
     envAuth = cookieEnv
       ? { headers: { Cookie: cookieEnv } }
       : { apiKey: jwt || apiKeyEnv };
-    try {
-      entries = await fetchCodeMieModels(apiUrl, {
-        bearer: jwt || apiKeyEnv,
-        cookieString: cookieEnv,
-      });
-    } catch (error) {
-      console.error(
-        `[codemie] Live model fetch failed (${
-          error instanceof Error ? error.message : String(error)
-        }).`
-      );
-    }
   }
 
-  // ---- Mode 2: OAuth SSO ---------------------------------------------------
+  // ---- Mode 2: OAuth SSO (login/refresh only run on /login) --------------
   let oauthBlock = null;
   let oauthCreds = null;
+  let activeBaseUrl = codeMieUrl;
 
   if (!envAuth) {
-
-    // Base URL used by login/refresh. Defaults to CODEMIE_BASE_URL or the
-    // public instance; /login lets the user override it interactively.
-    let activeBaseUrl = codeMieUrl;
-
     const makeOauthBlock = () => {
-      // Ask which CodeMie instance to log into. Pressing Enter accepts the
-      // default — same UX as the built-in provider logins.
       const resolveBaseUrl = async (callbacks) => {
         if (!process.env.CODEMIE_BASE_URL && callbacks?.onPrompt) {
           try {
@@ -573,7 +613,6 @@ export default async function (pi) {
           return { refresh: cred.refresh, access: cred.access, expires: cred.expires };
         },
         async refreshToken(credentials) {
-          // Still valid? Keep it (prevents redundant browser pop-ups).
           if (!isExpired(credentials)) return credentials;
           console.error("[codemie] SSO session expired — reopening browser for login...");
           const cred = await performLogin(activeBaseUrl);
@@ -582,9 +621,7 @@ export default async function (pi) {
           oauthCreds = cred;
           return { refresh: cred.refresh, access: cred.access, expires: cred.expires };
         },
-        getApiKey(credentials) {
-          return credentials.access;
-        },
+        getApiKey(credentials) { return credentials.access; },
       };
     };
     oauthBlock = makeOauthBlock();
@@ -603,53 +640,7 @@ export default async function (pi) {
       }
       persistSession(stored); // keep the cookie file in sync with auth.json
     }
-
-    // Discover models with the stored session, if any. A stale session may
-    // fail here — that's fine, we just fall back to the seed model list.
-    if (oauthCreds) {
-      let cookies = {};
-      try {
-        cookies = JSON.parse(oauthCreds.refresh ?? "{}")?.cookies ?? {};
-      } catch {}
-      const cookieString = Object.entries(cookies)
-        .map(([k, v]) => `${k}=${v}`)
-        .join(";");
-      const loadEntries = () =>
-        fetchCodeMieModels(apiUrl, {
-          bearer: oauthCreds.access,
-          cookieString,
-        });
-      try {
-        entries = await loadEntries();
-      } catch (firstError) {
-        // One retry for transient network hiccups before falling back quietly.
-        try {
-          entries = await loadEntries();
-        } catch {
-          const detail =
-            firstError instanceof Error ? firstError.message : String(error);
-          console.error(
-            `[codemie] Model discovery failed (${detail}); showing a reduced ` +
-              "list. /login codemie or restart to reload the full catalog."
-          );
-        }
-      }
-    }
   }
-
-  // ---- Fallback / seed models --------------------------------------------
-  if (entries.length === 0 && process.env.CODEMIE_MODEL) {
-    entries = [convertLlmModel({ deployment_name: process.env.CODEMIE_MODEL })];
-  }
-  if (entries.length === 0) {
-    // No session yet — still register the provider (so /login codemie exists
-    // and models are selectable); after login the real list loads on restart.
-    entries = seedModels();
-  }
-
-  // ---- Provider registration ----------------------------------------------
-
-  const routedModels = routeModels(entries, apiUrl);
 
   const authConfig = envAuth
     ? envAuth
@@ -664,15 +655,61 @@ export default async function (pi) {
         }
       : undefined;
 
-  if (routedModels.length > 0) {
+  // ---- codemie-cli: SAME account/session, different billing channel -------
+  // (see README "Two billing channels" for the measurement that pinned down
+  // X-CodeMie-Project as the bucket-attribution header.)
+  const cliSessionId = randomUUID();
+  const cliRequestId = randomUUID();
+  const cliChannelHeaders = {
+    "X-CodeMie-Client": "codemie-pi",
+    "X-CodeMie-CLI": "codemie-cli/1.0.0",
+    "X-CodeMie-Session-ID": cliSessionId,
+    "X-CodeMie-Request-ID": cliRequestId,
+  };
+
+  // Register both providers from a model list (+ optional resolved cli project).
+  // Called once now with seed models, and again in the background once live
+  // model discovery completes — pi applies post-load registrations immediately,
+  // so this hot-swaps the catalog without a /reload.
+  function registerProviders(modelEntries, cliProject) {
+    const routed = routeModels(modelEntries, apiUrl);
+    if (routed.length === 0) return;
+
     pi.registerProvider("codemie", {
       name: "CodeMie",
       baseUrl: `${apiUrl}/v1`,
       ...authConfig,
       api: "openai-completions",
-      models: routedModels,
+      models: routed,
+    });
+
+    // Clone (deep enough: top-level model + nested cost/compat/thinkingLevelMap
+    // objects) rather than reusing `routed`/nested objects by reference across
+    // two registerProvider() calls, in case pi/pi-ai attaches per-registration
+    // state (e.g. a resolved `provider` id) onto the model objects it's given.
+    const cliModels = routed.map((m) => ({
+      ...m,
+      cost: { ...m.cost },
+      ...(m.compat ? { compat: { ...m.compat } } : {}),
+      ...(m.thinkingLevelMap ? { thinkingLevelMap: { ...m.thinkingLevelMap } } : {}),
+    }));
+    pi.registerProvider("codemie-cli", {
+      name: "CodeMie (CLI billing channel)",
+      baseUrl: `${apiUrl}/v1`,
+      ...authConfig,
+      headers: {
+        ...(authConfig?.headers ?? {}),
+        ...cliChannelHeaders,
+        ...(cliProject ? { "X-CodeMie-Project": cliProject } : {}),
+      },
+      api: "openai-completions",
+      models: cliModels,
     });
   }
+
+  // ---- Register immediately with cached (or seed) models (no network) -------
+  const cached = loadCache(apiUrl);
+  registerProviders(cached?.models ?? seedModels(), cached?.cliProject);
 
   /** Headers for ad-hoc authenticated requests (usage/analytics), mirroring
    * whichever auth mode is currently active. Re-read on every call so a
@@ -685,90 +722,7 @@ export default async function (pi) {
     return {};
   }
 
-  // ---- codemie-cli: SAME account/session, different billing channel -------
-  //
-  // CONFIRMED by measurement (before/after `/codemie-usage` across 4
-  // isolated test configurations — see README "Two billing channels"): the
-  // header that actually decides bucket attribution is `X-CodeMie-Project`
-  // (plus `X-CodeMie-Session-ID`/`X-CodeMie-Request-ID` needing to be
-  // *valid UUIDs*, though NOT unique per request). Sending
-  // `X-CodeMie-Client`/`X-CodeMie-CLI` alone (no Project, or malformed
-  // UUIDs) does nothing — spend still lands in the plain Web/Platform
-  // bucket. Adding a correctly-formed `X-CodeMie-Project` (the account's
-  // email/username, from `GET {apiUrl}/v1/user`) on top of the SAME
-  // SSO-cookie session used by `codemie` reliably shifts spend into the
-  // "(cli)" bucket instead — reproduced twice, no separate account, no JWT
-  // needed. This mirrors codemie-code's own HeaderInjectionPlugin, which
-  // sends this exact header set on every request its proxy forwards.
-  const cliSessionId = randomUUID();
-  const cliRequestId = randomUUID();
-  const cliChannelHeaders = {
-    "X-CodeMie-Client": "codemie-pi",
-    "X-CodeMie-CLI": "codemie-cli/1.0.0",
-    "X-CodeMie-Session-ID": cliSessionId,
-    "X-CodeMie-Request-ID": cliRequestId,
-  };
-
-  // Best-effort: resolve the account's project (email/username) so the
-  // gateway can attribute spend to `<project> (cli)`. Uses the exact same
-  // credentials as `codemie` (cookie or Bearer, whichever is active) — no
-  // extra login. If this fails (offline, stale session, etc.), `codemie-cli`
-  // registers WITHOUT `X-CodeMie-Project`.
-  //
-  // CONFIRMED (2026-08-27, before/after `GET /v1/analytics/summaries` and
-  // `/v1/analytics/budget_usage`): this does NOT fall back to the plain
-  // Web/Platform bucket as previously assumed. Requests missing
-  // `X-CodeMie-Project` still increment the account-wide
-  // `summaries.total_money_spent` / `summaries.cli_cost` (i.e. real money is
-  // spent and it IS counted), but they do not appear in ANY row of
-  // `budget_usage` — not plain, not "(cli)", not "(premium)". The spend
-  // becomes invisible to `/codemie-usage` specifically, not to billing. This
-  // is the reason `/codemie-usage` now also calls `cli-summary` (see below)
-  // as a cross-check for this exact orphaned-spend scenario. Whether an
-  // *enforced dollar cap* still applies to this unattributed spend is
-  // unconfirmed — not tested, since deliberately exhausting a budget purely
-  // to observe the error response is too risky to try against a real
-  // account. Do not rely on omitting this header as a way around the
-  // "(cli)"/plain budget limits.
-  let cliProject;
-  try {
-    const cookies = oauthCreds ? cookieStringFromCredential(oauthCreds) : "";
-    cliProject = await fetchCodeMieProject(apiUrl, {
-      bearer: envAuth?.apiKey,
-      cookieString: envAuth?.headers?.Cookie ?? cookies,
-    });
-  } catch (error) {
-    console.error(
-      `[codemie-cli] Could not resolve account project for X-CodeMie-Project (${
-        error instanceof Error ? error.message : String(error)
-      }); usage until next restart will still be billed for real but will NOT ` +
-        `show up in any /codemie-usage row (see summaries.total_money_spent instead).`
-    );
-  }
-  if (cliProject) cliChannelHeaders["X-CodeMie-Project"] = cliProject;
-
-  if (routedModels.length > 0) {
-    // Clone (deep enough: top-level model + nested cost/compat/thinkingLevelMap
-    // objects) rather than reusing `routedModels`/nested objects by reference
-    // across two registerProvider() calls, in case pi/pi-ai attaches
-    // per-registration state (e.g. a resolved `provider` id) onto the model
-    // objects it's given.
-    const cliModels = routedModels.map((m) => ({
-      ...m,
-      cost: { ...m.cost },
-      ...(m.compat ? { compat: { ...m.compat } } : {}),
-      ...(m.thinkingLevelMap ? { thinkingLevelMap: { ...m.thinkingLevelMap } } : {}),
-    }));
-    pi.registerProvider("codemie-cli", {
-      name: "CodeMie (CLI billing channel)",
-      baseUrl: `${apiUrl}/v1`,
-      ...authConfig,
-      headers: { ...(authConfig?.headers ?? {}), ...cliChannelHeaders },
-      api: "openai-completions",
-      models: cliModels,
-    });
-  }
-
+  // ---- Commands & status bar (unchanged) ----------------------------------
   registerPricesCommand(pi);
   registerUsageCommand(pi, () => apiUrl, () => buildAuthHeaders());
   // Both status widgets read the SAME account's budget_usage response (one
@@ -777,6 +731,50 @@ export default async function (pi) {
   // "codemie-cli" shows ONLY the "(cli)" row.
   registerUsageStatusBar(pi, "codemie", "codemie-usage-status", "💰", "web", () => apiUrl, () => buildAuthHeaders());
   registerUsageStatusBar(pi, "codemie-cli", "codemie-cli-usage-status", "🖥️", "cli", () => apiUrl, () => buildAuthHeaders());
+
+  // ---- Background model discovery (non-blocking) --------------------------
+  // Live discovery + cli project resolution run after startup so pi is usable
+  // immediately. Failures are silent — the seed list already registered stays.
+  setTimeout(() => backgroundDiscover().catch(() => {}), 100);
+
+  async function backgroundDiscover() {
+    let bearer;
+    let cookieString = "";
+    if (envAuth) {
+      bearer = envAuth.apiKey;
+      cookieString = envAuth.headers?.Cookie ?? "";
+    } else if (oauthCreds) {
+      bearer = oauthCreds.access;
+      cookieString = cookieStringFromCredential(oauthCreds);
+    } else {
+      return; // no credentials → keep seed list
+    }
+
+    let entries;
+    try {
+      entries = await fetchCodeMieModels(apiUrl, { bearer, cookieString });
+    } catch (error) {
+      console.error(
+        `[codemie] Live model fetch failed (${
+          error instanceof Error ? error.message : String(error)
+        }). Keeping seed list.`
+      );
+      return;
+    }
+    if (!entries || entries.length === 0) return; // keep seed list
+
+    // Best-effort: resolve the account project for the (cli) billing bucket.
+    let cliProject;
+    try {
+      cliProject = await fetchCodeMieProject(apiUrl, { bearer, cookieString });
+    } catch {
+      // usage still billed for real but won't show in any /codemie-usage row
+      // (see summaries.total_money_spent) — acceptable, just less visible.
+    }
+
+    registerProviders(entries, cliProject);
+    saveCache(apiUrl, entries, cliProject);
+  }
 }
 
 // ---------------------------------------------------------------------------
