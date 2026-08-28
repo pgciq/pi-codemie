@@ -935,7 +935,7 @@ export default function (pi) {
   // ---- Commands & status bar (unchanged) ----------------------------------
   registerPricesCommand(pi);
   registerCapabilitiesCommand(pi);
-  pi.registerEntryRenderer("codemie-generated-image", (entry, _options, theme) => {
+  pi.registerEntryRenderer?.("codemie-generated-image", (entry, _options, theme) => {
     const image = entry.data ?? {};
     // pi passes an entry-renderer `theme` that lacks `fallbackColor()`, which
     // `Image.render` calls. Wrap it so inline previews render and never throw.
@@ -1089,7 +1089,7 @@ function registerPricesCommand(pi) {
     },
   });
 
-  pi.registerEntryRenderer("codemie-prices", (entry) => {
+  pi.registerEntryRenderer?.("codemie-prices", (entry) => {
     const data = entry.data;
     const mdTheme = getMarkdownTheme();
     return new Markdown(data.markdown, 1, 0, mdTheme);
@@ -1158,7 +1158,7 @@ function registerCapabilitiesCommand(pi) {
     },
   });
 
-  pi.registerEntryRenderer("codemie-capabilities", (entry) => {
+  pi.registerEntryRenderer?.("codemie-capabilities", (entry) => {
     const mdTheme = getMarkdownTheme();
     return new Markdown(entry.data.markdown, 1, 0, mdTheme);
   });
@@ -1391,7 +1391,7 @@ function registerUsageCommand(pi, getApiUrl, getAuthHeaders) {
     },
   });
 
-  pi.registerEntryRenderer("codemie-usage", (entry) => {
+  pi.registerEntryRenderer?.("codemie-usage", (entry) => {
     const data = entry.data;
     const mdTheme = getMarkdownTheme();
     return new Markdown(data.markdown, 1, 0, mdTheme);
