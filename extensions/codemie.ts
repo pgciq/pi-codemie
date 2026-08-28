@@ -55,9 +55,16 @@ import { createServer } from "node:http";
 import { execFile } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { Image, Markdown } from "@earendil-works/pi-tui";
+
+// Convert an absolute path to a clickable Markdown link. The TUI renders
+// `[label](url)` as an OSC 8 hyperlink, so the saved file opens in one click.
+function fileLink(p, label = p) {
+  return `[${label}](${pathToFileURL(String(p)).href})`;
+}
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 
 const AUTH_FILE = join(homedir(), ".pi", "agent", "auth.json");
@@ -822,7 +829,7 @@ export default function (pi) {
           const saved = await saveGeneratedImage(url);
           if (saved) savedImages.push(saved);
         }
-        const imageNotice = savedImages.map((image) => `Generated image saved to: ${image.path}`).join("\n");
+        const imageNotice = savedImages.map((image) => `Generated image saved to: ${fileLink(image.path)}`).join("\n");
         const displayText = [text, imageNotice].filter(Boolean).join(text && imageNotice ? "\n\n" : "");
 
         if (displayText) {
@@ -930,11 +937,16 @@ export default function (pi) {
   registerCapabilitiesCommand(pi);
   pi.registerEntryRenderer("codemie-generated-image", (entry, _options, theme) => {
     const image = entry.data ?? {};
+    // pi passes an entry-renderer `theme` that lacks `fallbackColor()`, which
+    // `Image.render` calls. Wrap it so inline previews render and never throw.
+    const imageTheme = theme && typeof theme.fallbackColor === "function"
+      ? theme
+      : { fallbackColor: (s) => (theme && theme.fg ? theme.fg("toolOutput", s) : s) };
     try {
       const data = readFileSync(image.path).toString("base64");
-      return new Image(data, image.mimeType || "image/png", theme, { maxWidthCells: 80, maxHeightCells: 30 });
+      return new Image(data, image.mimeType || "image/png", imageTheme, { maxWidthCells: 80, maxHeightCells: 30 });
     } catch {
-      return new Markdown(`Generated image unavailable: ${image.path ?? "unknown path"}`, 1, 0, getMarkdownTheme());
+      return new Markdown(`Generated image unavailable: ${fileLink(image.path ?? "unknown path")}`, 1, 0, getMarkdownTheme());
     }
   });
   registerUsageCommand(pi, () => apiUrl, () => buildAuthHeaders());
