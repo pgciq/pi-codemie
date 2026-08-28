@@ -57,7 +57,8 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
-import { Markdown } from "@earendil-works/pi-tui";
+import { Image, Markdown } from "@earendil-works/pi-tui";
+import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 
 const AUTH_FILE = join(homedir(), ".pi", "agent", "auth.json");
 const COOKIE_FILE = join(homedir(), ".pi", "agent", "codemie-cookie.txt");
@@ -92,6 +93,7 @@ function withTimeout(signal, ms) {
 // SSO session).
 const CACHE_DIR = join(homedir(), ".pi", "cache");
 const CACHE_FILE = join(CACHE_DIR, "codemie-models.json");
+const GENERATED_IMAGE_DIR = join(CACHE_DIR, "codemie-generated-images");
 const CACHE_TTL = 24 * 60 * 60 * 1000; // 24h
 
 function loadCache(apiUrl) {
@@ -690,6 +692,182 @@ export default function (pi) {
     "X-CodeMie-Request-ID": cliRequestId,
   };
 
+  // --- Image-generation echo -------------------------------------------------
+  // CodeMie has no dedicated /images endpoint — image generation rides the
+  // standard chat/completions path and the model returns the image inline in
+  // `message.images[]` (verified live). pi's built-in OpenAI adapter drops
+  // `message.images`, so for image-capable models we use a custom streamSimple
+  // that calls chat/completions (non-streaming), saves the images, and adds
+  // TUI-only Image entries while exposing the saved paths in the assistant text.
+  let resolvedCliProject;
+
+  function baseOutput(model, stopReason) {
+    return {
+      role: "assistant",
+      content: [],
+      api: model.api,
+      provider: model.provider,
+      model: model.id,
+      usage: {
+        input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+      stopReason,
+      timestamp: Date.now(),
+    };
+  }
+
+  async function saveGeneratedImage(url) {
+    if (!url || typeof url !== "string") return null;
+    let mimeType = "image/png";
+    let data;
+    const dataUri = /^data:([^;,]+);base64,(.*)$/s.exec(url);
+    if (dataUri) {
+      mimeType = dataUri[1] || mimeType;
+      data = Buffer.from(dataUri[2], "base64");
+    } else {
+      const response = await fetch(url);
+      if (!response.ok) throw new Error(`Unable to download CodeMie image: HTTP ${response.status}`);
+      const contentType = response.headers.get("content-type");
+      if (contentType?.startsWith("image/")) mimeType = contentType.split(";", 1)[0];
+      data = Buffer.from(await response.arrayBuffer());
+    }
+    if (!data?.length) throw new Error("CodeMie returned an empty image");
+    if (!existsSync(GENERATED_IMAGE_DIR)) mkdirSync(GENERATED_IMAGE_DIR, { recursive: true });
+    const extension = mimeType.includes("jpeg") ? "jpg" : mimeType.includes("webp") ? "webp" : "png";
+    const path = join(GENERATED_IMAGE_DIR, `codemie-${Date.now()}-${randomUUID().slice(0, 8)}.${extension}`);
+    writeFileSync(path, data);
+    return { path, mimeType };
+  }
+
+  function textOf(m) {
+    if (typeof m?.content === "string") return m.content;
+    if (Array.isArray(m?.content)) {
+      return m.content.filter((p) => p?.type === "text").map((p) => p.text ?? "").join("\n");
+    }
+    return "";
+  }
+
+  function contentParts(m) {
+    if (typeof m?.content === "string") return m.content;
+    if (Array.isArray(m?.content)) {
+      const parts = [];
+      for (const p of m.content) {
+        if (p?.type === "text") parts.push({ type: "text", text: p.text ?? "" });
+        else if (p?.type === "image") {
+          const src = p.source;
+          const url = src?.type === "base64" ? `data:${src.mediaType || "image/png"};base64,${src.data}` : src?.url ?? src?.uri;
+          if (url) parts.push({ type: "image_url", image_url: { url } });
+        }
+      }
+      return parts;
+    }
+    if (Array.isArray(m?.images)) {
+      const parts = [{ type: "text", text: textOf(m) }];
+      for (const img of m.images) {
+        const url = typeof img === "string" ? img : img?.url ?? img?.image_url?.url ?? "";
+        if (url) parts.push({ type: "image_url", image_url: { url } });
+      }
+      return parts;
+    }
+    return textOf(m);
+  }
+
+  function toOpenAIMessages(context) {
+    const out = [];
+    const hasSystemPrompt = !!context?.systemPrompt;
+    if (hasSystemPrompt) out.push({ role: "system", content: context.systemPrompt });
+    const msgs = Array.isArray(context?.messages) ? context.messages : [];
+    for (const m of msgs) {
+      const role = m?.role;
+      if (role === "system") {
+        if (!hasSystemPrompt) out.push({ role: "system", content: textOf(m) });
+        continue;
+      }
+      if (role === "user") out.push({ role: "user", content: contentParts(m) });
+      else if (role === "assistant") out.push({ role: "assistant", content: textOf(m) });
+      else if (role === "tool") out.push({ role: "tool", content: textOf(m), tool_call_id: m?.toolCallId });
+    }
+    return out;
+  }
+
+  function streamCodeMieImage(model, context, options, baseUrl, getHeaders) {
+    const stream = createAssistantMessageEventStream();
+    const output = baseOutput(model, "pending");
+    (async () => {
+      try {
+        stream.push({ type: "start", partial: output });
+        const messages = toOpenAIMessages(context);
+        const body = { model: model.id, messages, stream: false };
+        if (model?.samplingParams?.temperature != null) body.temperature = model.samplingParams.temperature;
+        const headers = { "Content-Type": "application/json", ...getHeaders() };
+        const response = await fetch(`${baseUrl}/chat/completions`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(body),
+          signal: options?.signal,
+        });
+        if (!response.ok) {
+          const txt = await response.text().catch(() => "");
+          throw new Error(`CodeMie image API HTTP ${response.status}: ${txt.slice(0, 400)}`);
+        }
+        const data = await response.json();
+        const choice = Array.isArray(data?.choices) ? data.choices[0] : undefined;
+        const msg = choice?.message ?? {};
+        const text = typeof msg.content === "string" ? msg.content : "";
+        const images = Array.isArray(msg.images) ? msg.images : [];
+        const savedImages = [];
+        for (const img of images) {
+          const url = img?.image_url?.url ?? img?.url ?? "";
+          const saved = await saveGeneratedImage(url);
+          if (saved) savedImages.push(saved);
+        }
+        const imageNotice = savedImages.map((image) => `Generated image saved to: ${image.path}`).join("\n");
+        const displayText = [text, imageNotice].filter(Boolean).join(text && imageNotice ? "\n\n" : "");
+
+        if (displayText) {
+          output.content.push({ type: "text", text: "" });
+          const ci = output.content.length - 1;
+          stream.push({ type: "text_start", contentIndex: ci, partial: output });
+          const block = output.content[ci];
+          block.text += displayText;
+          stream.push({ type: "text_delta", contentIndex: ci, delta: displayText, partial: output });
+          stream.push({ type: "text_end", contentIndex: ci, content: block.text, partial: output });
+        }
+        for (const image of savedImages) {
+          pi.appendEntry("codemie-generated-image", image);
+        }
+        if (savedImages.length === 0 && !text) {
+          throw new Error("CodeMie returned neither an image nor text");
+        }
+        output.stopReason = choice?.finish_reason ?? "stop";
+        stream.push({ type: "done", reason: output.stopReason, message: output });
+        stream.end();
+      } catch (error) {
+        output.stopReason = options?.signal?.aborted ? "aborted" : "error";
+        output.errorMessage = error instanceof Error ? error.message : String(error);
+        stream.push({ type: "error", reason: output.stopReason, error: output });
+        stream.end();
+      }
+    })();
+    return stream;
+  }
+
+  function streamCodeMie(model, context, options) {
+    if (model?.capabilities?.image) {
+      const getHeaders =
+        model.provider === "codemie-cli"
+          ? () => ({
+              ...buildAuthHeaders(),
+              ...cliChannelHeaders,
+              ...(resolvedCliProject ? { "X-CodeMie-Project": resolvedCliProject } : {}),
+            })
+          : buildAuthHeaders;
+      return streamCodeMieImage(model, context, options, `${apiUrl}/v1`, getHeaders);
+    }
+    return openAICompletionsApi().streamSimple(model, context, options);
+  }
+
   // Register both providers from a model list (+ optional resolved cli project).
   // Called once now with seed models, and again in the background once live
   // model discovery completes — pi applies post-load registrations immediately,
@@ -703,6 +881,7 @@ export default function (pi) {
       baseUrl: `${apiUrl}/v1`,
       ...authConfig,
       api: "openai-completions",
+      streamSimple: streamCodeMie,
       models: routed,
     });
 
@@ -726,6 +905,7 @@ export default function (pi) {
         ...(cliProject ? { "X-CodeMie-Project": cliProject } : {}),
       },
       api: "openai-completions",
+      streamSimple: streamCodeMie,
       models: cliModels,
     });
   }
@@ -748,6 +928,15 @@ export default function (pi) {
   // ---- Commands & status bar (unchanged) ----------------------------------
   registerPricesCommand(pi);
   registerCapabilitiesCommand(pi);
+  pi.registerEntryRenderer("codemie-generated-image", (entry, _options, theme) => {
+    const image = entry.data ?? {};
+    try {
+      const data = readFileSync(image.path).toString("base64");
+      return new Image(data, image.mimeType || "image/png", theme, { maxWidthCells: 80, maxHeightCells: 30 });
+    } catch {
+      return new Markdown(`Generated image unavailable: ${image.path ?? "unknown path"}`, 1, 0, getMarkdownTheme());
+    }
+  });
   registerUsageCommand(pi, () => apiUrl, () => buildAuthHeaders());
   // Both status widgets read the SAME account's budget_usage response (one
   // account, multiple buckets) — they differ only in which row(s) they sum:
@@ -796,6 +985,7 @@ export default function (pi) {
       // (see summaries.total_money_spent) — acceptable, just less visible.
     }
 
+    resolvedCliProject = cliProject;
     registerProviders(entries, cliProject);
     saveCache(apiUrl, entries, cliProject);
   }
