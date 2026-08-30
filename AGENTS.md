@@ -73,21 +73,25 @@ package.json            ← pi extension manifest (no build/test scripts)
 
 ## Conventions & gotchas
 
-- **One account, multiple buckets.** `X-CodeMie-Project` is the header that
-  decides bucket attribution, but the effect of omitting it is
-  **account-dependent**. Omitting it is never free — spend always counts in
-  the account-wide `summaries`/`cli-summary` totals — yet whether it also
-  lands in a `budget_usage` row varies: the author's pgciq account produced
-  orphaned spend (2026-08-27), while gary_pan@epam.com attributes by *model
-  class* instead (non-premium → plain, premium → "(premium)", live-verified
-  2026-08-30), so a missing header alone never shifts spend into "(cli)" there.
+- **One account, multiple buckets.** Bucket attribution varies by
+  **backend/time — not by account** (pgciq is the author's username, not a
+  CodeMie account; login is always gary_pan on every machine). Omitting
+  `X-CodeMie-Project` is never free — spend always counts in the account-wide
+  `summaries`/`cli-summary` totals — but whether it also lands in a
+  `budget_usage` row (and which row) varies: on 2026-08-27 (author's other
+  machine, gary_pan login) missing it orphaned the spend, while on
+  2026-08-30 (this machine, gary_pan login) the gateway ignored the project
+  header entirely and resolved by **CLI header + model class** (non-premium +
+  `X-CodeMie-CLI` → "(cli)", non-premium without it → plain, premium →
+  "(premium)"; full 6-combination matrix plus a bogus-`X-CodeMie-Project`
+  probe all live-verified — no orphan reproducible).
   Never rely on any of this to dodge budget caps. `/codemie-usage` keeps an
   **Orphaned spend** row (`summaries.total_money_spent` − Σ `budget_usage`
   rows, shown when > 0) as a safety net for *any* spend the backend left out
-  of every budget row (missing project on affected accounts, unmapped model
-  class, request resolving to no customer, transient lag). To reproduce the
-  "missing `X-CodeMie-Project`" request shape on demand set
-  `CODEMIE_FORCE_NO_PROJECT=1` (outcome is account-dependent). The `summaries`
+  of every budget row (backend/time changes, unmapped model class, request
+  resolving to no customer, transient lag).
+  To reproduce the "missing `X-CodeMie-Project`" request shape on demand set
+  `CODEMIE_FORCE_NO_PROJECT=1` (outcome is backend/time-dependent). The `summaries`
   call passes `time_period=current_month` (constant `SUMMARIES_TIME_PERIOD`) to
   match the billing period, falling back to the default window if the param is
   rejected.

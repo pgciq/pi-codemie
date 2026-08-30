@@ -37,7 +37,7 @@ pi install /path/to/pi-codemie
 | `CODEMIE_API_KEY` | API key bearer token (CI mode). |
 | `CODEMIE_COOKIE` | Raw session cookie (CI mode). |
 | `CODEMIE_MODEL` | Static fallback model ID when live model discovery fails. |
-| `CODEMIE_FORCE_NO_PROJECT` | **Debug only.** Set to `1` to make `codemie-cli` omit the `X-CodeMie-Project` header, reproducing the "missing `X-CodeMie-Project`" request shape on demand (no failed `/v1/user` lookup needed). Note the billing outcome is account-dependent (see below); off by default. |
+| `CODEMIE_FORCE_NO_PROJECT` | **Debug only.** Set to `1` to make `codemie-cli` omit the `X-CodeMie-Project` header, reproducing the "missing `X-CodeMie-Project`" request shape on demand (no failed `/v1/user` lookup needed). Note the billing outcome is backend/time-dependent (see below); off by default. |
 
 ### Two billing channels, same account: `codemie` vs `codemie-cli`
 
@@ -51,8 +51,9 @@ buckets. `/codemie-usage` typically shows something like:
 | you@example.com (premium)   | $0.13  | $30.00       | ... |   ← premium-model bucket
 ```
 
-**Confirmed mechanism** (4 isolated test configurations, each verified with a
-before/after `/codemie-usage` comparison across several real requests):
+**Confirmed mechanism** (4 isolated test configurations on 2026-08-27, author's other
+machine, each verified with a before/after `/codemie-usage` comparison across
+several real requests):
 
 1. Sending only `X-CodeMie-Client`/`X-CodeMie-CLI` on top of the plain
    OAuth-SSO cookie session — **no effect**, spend stayed in the plain
@@ -62,7 +63,7 @@ before/after `/codemie-usage` comparison across several real requests):
    injects its full header set) — **worked**, shifted spend into "(cli)".
 3. Direct-to-gateway (no local proxy) with that same full header set copied
    exactly — **worked** identically to (2).
-4. Same as (3) minus `X-CodeMie-Project` — **no effect** again on the author's account, where that spend became orphaned (account-dependent; see below).
+4. Same as (3) minus `X-CodeMie-Project` — **no effect** again on 2026-08-27, where that spend became orphaned (see below).
 
 The deciding header is **`X-CodeMie-Project`** (the account's email/username,
 tied to which LiteLLM budget row a request is charged against), together with
@@ -91,10 +92,10 @@ pi --model codemie-cli/gpt-5.1-codex "..."  # billed to the "(cli)" bucket — s
 If the `/v1/user` lookup fails at startup (offline, stale session, etc.),
 `codemie-cli` still registers without `X-CodeMie-Project` — check the startup
 log for a `[codemie-cli] Could not resolve account project` warning. What that
-means for billing is **account-dependent** — orphaned on some accounts, plain/
+means for billing is **backend/time-dependent** — orphaned on some setups, plain/
 premium by model class on others (see below, confirmed 2026-08-27 & 2026-08-30).
 
-#### What happens without `X-CodeMie-Project`: account-dependent, never free
+#### What happens without `X-CodeMie-Project`: backend/time-dependent, never free
 
 Omitting `X-CodeMie-Project` (deliberately, or via the startup-lookup-failure
 path above) does **not** make requests free — spend is always real and always
@@ -102,9 +103,10 @@ counted in the account-wide `GET /v1/analytics/summaries` totals (the numbers
 behind the
 [analytics dashboard](https://codemie.lab.epam.com/analytics?tab=insights)'s
 "Summary Metrics" → "Total Money Spent" card). Whether it also lands in a
-`budget_usage` row is **account-dependent**:
+`budget_usage` row is **backend/time-dependent** (pgciq is the author's
+username, not a CodeMie account — login is always gary_pan, on every machine):
 
-- **Some accounts (e.g. the author's pgciq account, confirmed 2026-08-27):**
+- **2026-08-27 (author's other machine, gary_pan login):**
   the spend stays out of every `budget_usage` row (orphaned). Verified with a
   before/after comparison across 4 real requests, same session, headers
   identical except for the missing `X-CodeMie-Project`:
@@ -118,14 +120,28 @@ behind the
   | `summaries.cli_cost` | $0.27 | $0.29 | **yes, +$0.02 (matches total exactly)** |
   | `summaries.cli_invoked` | 910 | 914 | **yes, +4 (exactly our request count)** |
 
-- **Other accounts (e.g. gary_pan@epam.com, confirmed 2026-08-30 with two
-  live before/after tests):** the gateway falls back to attributing by
-  *model class* when `X-CodeMie-Project` is absent — non-premium models land
-  in the plain Web/Platform row, premium models (e.g. `o1`) in the
-  "(premium)" row. No orphaned spend is produced, and a missing header alone
-  never shifts spend into "(cli)". `CODEMIE_FORCE_NO_PROJECT=1` here
-  reproduces the request *shape* (useful for header-level testing), not
-  necessarily a visible "Orphaned spend" row.
+- **2026-08-30 (this machine, gary_pan login) — full live matrix.** Every
+  request shape below was sent for real against the gateway and the resulting
+  `budget_usage` row verified (before/after, ~10 min lag). The rule on this
+  backend: **CLI header + model class decide the bucket; `X-CodeMie-Project`
+  is ignored.**
+
+  | # | `X-CodeMie-CLI` | `X-CodeMie-Project` | model class | lands in | verified |
+  |---|---|---|---|---|---|
+  | 1 | no | no | non-premium (`gemini-3.1-pro`) | plain Web/Platform | ✅ live, +$0.03 |
+  | 2 | no | no | premium (`o1`) | (premium) | ⚠️ inferred (same rule as #4) |
+  | 3 | yes | yes | non-premium | (cli) | ✅ live (4-config test, 2026-08-27) |
+  | 4 | yes | yes | premium | (premium) | ⚠️ inferred (README: "premium from either channel") |
+  | 5 | yes | no | premium (`o1`) | (premium) | ✅ live, +$0.09 |
+  | 6 | yes | no | non-premium (`gemini-3.1-pro`) | (cli) | ✅ live, +$0.05 |
+  | 7 | yes | `nonexistent@epam.com` | non-premium | (cli) | ✅ live (bogus project still attributed) |
+  | 8 | no | `nonexistent@epam.com` | non-premium | plain | ✅ live |
+  | 9 | yes | no (UUIDs omitted) | non-premium | (cli) | ✅ live (missing UUIDs still attributed) |
+
+  Takeaways: a missing `X-CodeMie-Project` (or even a bogus one) does **not**
+  orphan spend on this backend — it's attributed by CLI header + model class.
+  `cli_cost` only moves when `X-CodeMie-CLI` is present. `CODEMIE_FORCE_NO_PROJECT=1`
+  reproduces the *shape* for testing but yields no visible "Orphaned spend" row here.
 
 Either way, spend that no `budget_usage` row accounts for is invisible to the
 budget table alone, which is exactly why `/codemie-usage` also calls
@@ -137,7 +153,7 @@ by design — answering that for certain would require deliberately exhausting
 a real budget to observe the error response, which felt too risky to test
 against a live account. What we know: LiteLLM (which CodeMie's gateway is
 built on) enforces per-request budget checks against whichever `customer_id`/
-`team_id` a request resolves to; on accounts where a header-less request resolves to no
+`team_id` a request resolves to; where a header-less request resolves to no
 customer object (or a different, unmanaged one), which would
 mean it's checked against the parent API key's budget instead of any of your
 three personal buckets — that key's budget, if any, is not something this
@@ -169,7 +185,7 @@ link to the full dashboard. If that fetch fails (network hiccup, etc.),
 This is also the practical reason this section exists at all: it's the
 only place `/codemie-usage` can surface **orphaned spend** — spend counted in
 the account-wide `summaries`/`cli-summary` totals that no `budget_usage` row
-shows (see above, account-dependent). `summaries`/`cli-summary`'s totals still
+shows (see above, backend/time-dependent). `summaries`/`cli-summary`'s totals still
 catch that spend even when the per-project budget table can't attribute it.
 
 For a deeper per-client breakdown than the command surfaces, query the
@@ -245,7 +261,7 @@ pi --model codemie/claude-opus-4-6 "你好"
 |---|---|
 | `/codemie-prices [input\|output\|total\|context] [asc\|desc]` | List CodeMie models (same catalog for both `codemie` and `codemie-cli`) with per-million-token input/output/cache-read/cache-write pricing, sorted by price (default: total cost ascending) or context window. |
 | `/codemie-capabilities [image\|video\|audio\|vision\|reasoning\|tools]` | List each CodeMie deployment's capabilities (vision via `multimodal`, image generation via `supports_image_generation`, tools via `features.tools`, reasoning via model id; video/audio are not exposed by CodeMie so always `—`); an optional filter narrows the table to deployments that support that capability. |
-| `/codemie-usage` | Show current CodeMie account budget/quota usage — all billing channels/rows (`GET {apiUrl}/v1/analytics/budget_usage`), plus a fast near-real-time CLI-channel summary (`GET {apiUrl}/v1/analytics/cli-summary`) and a link to the [full insights dashboard](https://codemie.lab.epam.com/analytics?tab=insights). It also lists **orphaned spend** — real money counted in the account-wide total (`GET {apiUrl}/v1/analytics/summaries` `total_money_spent`) but absent from every `budget_usage` row (account-dependent: missing `X-CodeMie-Project` orphans it on some accounts, while others attribute by model class; also possible for unmapped model classes or requests resolving to no customer). The `summaries` query is aligned to the current billing period (`time_period=current_month`, with fallback to the default window). |
+| `/codemie-usage` | Show current CodeMie account budget/quota usage — all billing channels/rows (`GET {apiUrl}/v1/analytics/budget_usage`), plus a fast near-real-time CLI-channel summary (`GET {apiUrl}/v1/analytics/cli-summary`) and a link to the [full insights dashboard](https://codemie.lab.epam.com/analytics?tab=insights). It also lists **orphaned spend** — real money counted in the account-wide total (`GET {apiUrl}/v1/analytics/summaries` `total_money_spent`) but absent from every `budget_usage` row (backend/time-dependent: missing `X-CodeMie-Project` orphaned it on 2026-08-27, while on 2026-08-30 the gateway attributed by CLI header + model class; also possible for unmapped model classes or requests resolving to no customer). The `summaries` query is aligned to the current billing period (`time_period=current_month`, with fallback to the default window). |
 
 The footer/status bar shows a compact live indicator per billing channel, refreshed every 10 minutes: `💰 $spent/$limit (pct%)` while a `codemie/*` model is active (sums every row except "(cli)"), and `🖥️ $spent/$limit (pct%)` while a `codemie-cli/*` model is active (sums only the "(cli)" row). Both read the same account's `budget_usage` response — they just report different buckets. Note: `budget_usage` lags real spend by roughly 5-10 minutes (confirmed by timing real requests against repeated polls), so the indicator is not second-by-second live.
 
