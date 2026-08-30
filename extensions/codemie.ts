@@ -82,6 +82,16 @@ const CODIEMIE_FETCH_TIMEOUT_MS = 8_000;
 // Merge an optional external abort signal with a hard per-call timeout.
 const CODIEME_FETCH_TIMEOUT_MS = 8_000;
 
+// Align the /v1/analytics/summaries window with the current billing period
+// (budget_usage resets monthly) so the orphaned-spend gap isn't inflated by a
+// window mismatch. Falls back to the endpoint's default window if unsupported.
+const SUMMARIES_TIME_PERIOD = "current_month";
+
+// Debug/verification only: when "1", codemie-cli omits X-CodeMie-Project,
+// reproducing the "orphaned spend" scenario on demand (no failed /v1/user
+// lookup needed). Off by default.
+const FORCE_NO_PROJECT = process.env.CODEMIE_FORCE_NO_PROJECT === "1";
+
 function withTimeout(signal, ms) {
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), ms);
@@ -867,7 +877,7 @@ export default function (pi) {
           ? () => ({
               ...buildAuthHeaders(),
               ...cliChannelHeaders,
-              ...(resolvedCliProject ? { "X-CodeMie-Project": resolvedCliProject } : {}),
+              ...(resolvedCliProject && !FORCE_NO_PROJECT ? { "X-CodeMie-Project": resolvedCliProject } : {}),
             })
           : buildAuthHeaders;
       return streamCodeMieImage(model, context, options, `${apiUrl}/v1`, getHeaders);
@@ -909,7 +919,7 @@ export default function (pi) {
       headers: {
         ...(authConfig?.headers ?? {}),
         ...cliChannelHeaders,
-        ...(cliProject ? { "X-CodeMie-Project": cliProject } : {}),
+        ...(cliProject && !FORCE_NO_PROJECT ? { "X-CodeMie-Project": cliProject } : {}),
       },
       api: "openai-completions",
       streamSimple: streamCodeMie,
@@ -1202,6 +1212,30 @@ async function fetchCliInsightsSummary(apiUrl, headers, timePeriod = "last_24_ho
   return res.json();
 }
 
+/**
+ * Account-wide spend totals (GET /v1/analytics/summaries) — the same numbers
+ * behind the analytics dashboard's "Total Money Spent" card. Used to surface
+ * "orphaned" spend: real money counted here but absent from every
+ * `budget_usage` row (see buildUsageMarkdown). Best-effort: its failure must
+ * not block the budget table above.
+ */
+async function fetchSummaries(apiUrl, headers, timePeriod = SUMMARIES_TIME_PERIOD) {
+  const base = `${apiUrl.replace(/\/+$/, "")}/v1/analytics/summaries`;
+  const url = timePeriod ? `${base}?time_period=${encodeURIComponent(timePeriod)}` : base;
+  const res = await fetch(url, { headers, redirect: "follow" });
+  if (!res.ok) {
+    // The param may be unsupported on some instances — retry without it so the
+    // orphaned-spend row still works off the default (last-30d) window.
+    if (timePeriod) {
+      const fallback = await fetch(base, { headers, redirect: "follow" });
+      if (fallback.ok) return fallback.json();
+      throw new Error(`HTTP ${fallback.status} ${fallback.statusText}`);
+    }
+    throw new Error(`HTTP ${res.status} ${res.statusText}`);
+  }
+  return res.json();
+}
+
 /** Flatten `{ data: { metrics: [{ id, value }, ...] } }` into `{ id: value }`. */
 function summarizeCliInsights(payload) {
   const metrics = payload?.data?.metrics;
@@ -1211,6 +1245,46 @@ function summarizeCliInsights(payload) {
     if (m && typeof m === "object" && typeof m.id === "string") byId[m.id] = m.value;
   }
   return byId;
+}
+
+/** Coerce a value to a finite number, tolerating string-encoded amounts
+ * (e.g. "27.89" or "$27.89" — CodeMie sometimes returns numbers as strings). */
+function toFiniteNumber(v) {
+  if (typeof v === "number") return v;
+  if (typeof v === "string") {
+    const s = v.replace(/[^0-9.\-]/g, "");
+    if (s === "") return NaN;
+    const n = Number(s);
+    return Number.isFinite(n) ? n : NaN;
+  }
+  return NaN;
+}
+
+/** Best-effort JSON snapshot for diagnostics (never throws). */
+function safeDump(value) {
+  try {
+    return JSON.stringify(value).slice(0, 500);
+  } catch {
+    return String(value);
+  }
+}
+
+/**
+ * `GET /v1/analytics/summaries` returns the SAME `{ data: { metrics: [...] } }`
+ * envelope as cli-summary: a flat list of `{ id, value, ... }` metric objects
+ * (NOT an object keyed by metric name). Pull `total_money_spent` by matching the
+ * metric `id`. Tolerates string-encoded `value`s.
+ */
+function extractTotalSpent(payload) {
+  const metrics = payload?.data?.metrics;
+  if (!Array.isArray(metrics)) return undefined;
+  for (const m of metrics) {
+    if (m && m.id === "total_money_spent") {
+      const n = toFiniteNumber(m.value);
+      return Number.isFinite(n) ? n : undefined;
+    }
+  }
+  return undefined;
 }
 
 /** notify() is a no-op outside TUI/RPC (ctx.hasUI === false in print/json) — fall
@@ -1310,11 +1384,25 @@ function buildInsightsSection(insights, dashboardUrl) {
   return lines.join("\n");
 }
 
-function buildUsageMarkdown(payload, insights, dashboardUrl) {
+function buildUsageMarkdown(payload, insights, dashboardUrl, summaryTotal, summaryNote) {
   const rows = payload?.data?.rows;
   if (!Array.isArray(rows) || rows.length === 0) {
     return buildGenericMarkdown(payload) + "\n" + buildInsightsSection(insights, dashboardUrl);
   }
+
+  // Account-wide total (GET /v1/analytics/summaries) minus what the budget
+  // table attributes to any project. The gap is "orphaned" spend — real money
+  // counted in the account total but in NO budget_usage row (usually because
+  // X-CodeMie-Project was missing). NOTE: budget_usage lags ~5-10 min while
+  // summaries updates in ~20-30s, so this gap ALSO includes recently-made spend
+  // that simply hasn't synced into the budget table yet — not only true orphans.
+  const budgetTotal = rows.reduce(
+    (s, r) => s + (typeof r.current_spending === "number" ? r.current_spending : 0),
+    0
+  );
+  const orphaned =
+    typeof summaryTotal === "number" ? Math.max(0, summaryTotal - budgetTotal) : undefined;
+  const showOrphaned = typeof orphaned === "number" && orphaned > 0.001;
 
   const asOf = payload?.metadata?.data_as_of;
   const lines = [
@@ -1334,6 +1422,27 @@ function buildUsageMarkdown(payload, insights, dashboardUrl) {
         r.total
       )} | ${fmtTimestamp(r.budget_reset_at)} | ${r.time_until_reset ?? ""} |`
     ),
+    ...(showOrphaned
+      ? [
+          `| **Orphaned spend** | ${fmtMoney(orphaned)} | — | — | — | — |`,
+          "",
+          "_**Orphaned spend** = account-wide total (`/v1/analytics/summaries` " +
+            "`total_money_spent`) − sum of every `budget_usage` row. It is real, " +
+            "attributed to no project/bucket — usually because `X-CodeMie-Project` " +
+            "was missing on those requests. It is **not free** and may still hit a " +
+            "parent API-key budget cap. (This gap also folds in timing/window " +
+            "differences: `summaries` covers roughly the last 30 days per its " +
+            "metadata while `budget_usage` is the current billing period, plus the " +
+            "~5-10 min `budget_usage` lag — so a non-zero value is not purely true " +
+            "orphans.)_",
+        ]
+      : []),
+    ...(summaryNote
+      ? [
+          "",
+          `> Orphaned-spend check skipped: ${summaryNote}`,
+        ]
+      : []),
   ].filter((l) => l !== undefined);
 
   return lines.join("\n") + "\n" + buildInsightsSection(insights, dashboardUrl);
@@ -1377,9 +1486,29 @@ function registerUsageCommand(pi, getApiUrl, getAuthHeaders) {
           }); showing budget table only.`
         );
       }
+
+      // Best-effort supplement: account-wide total, to surface orphaned spend
+      // (real money counted here but in no budget_usage row). Its failure must
+      // not block the budget table above. `summaryNote` (if set) is surfaced in
+      // the output so a missing orphaned row is explainable instead of silent.
+      let summaryTotal;
+      let summaryNote;
+      try {
+        const raw = await fetchSummaries(apiUrl, headers);
+        summaryTotal = extractTotalSpent(raw);
+        if (typeof summaryTotal !== "number") {
+          // Embed the raw shape in the footnote so the user can paste the table
+          // directly (no need to hunt stderr) if the field is still unreadable.
+          summaryNote = `could not read \`total_money_spent\` from /v1/analytics/summaries (shape: ${safeDump(raw)})`;
+          console.error(`[codemie-usage] ${summaryNote}`);
+        }
+      } catch (error) {
+        summaryNote = `could not fetch /v1/analytics/summaries (${error instanceof Error ? error.message : String(error)})`;
+        console.error(`[codemie-usage] ${summaryNote}; orphaned-spend row omitted.`);
+      }
       const dashboardUrl = frontendFromApiBase(apiUrl);
 
-      const markdown = buildUsageMarkdown(data, insights, dashboardUrl);
+      const markdown = buildUsageMarkdown(data, insights, dashboardUrl, summaryTotal, summaryNote);
       if (ctx.mode === "tui") {
         pi.appendEntry("codemie-usage", { markdown });
       } else if (ctx.hasUI) {
