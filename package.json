@@ -1,6 +1,6 @@
 {
   "name": "pi-codemie",
-  "version": "1.0.19",
+  "version": "1.0.20",
   "description": "Pi extension for CodeMie (AI/Run) enterprise gateway provider",
   "keywords": [
     "pi-package",
