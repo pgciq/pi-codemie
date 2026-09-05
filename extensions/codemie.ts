@@ -583,12 +583,31 @@ function routeModels(entries, apiUrl) {
 /** Seed model list used when no session/model-discovery is available yet. */
 function seedModels() {
   const SEED_MODELS = [
+    // GPT
+    "gpt-4.1",
+    "gpt-5-2025-08-07",
     "gpt-5-mini-2025-08-07",
-    "gpt-5.1-codex-2025-11-13",
-    "gemini-3-pro",
-    "deepseek-v4-pro",
+    "gpt-5-nano-2025-08-07",
+    "gpt-5-1-codex-2025-11-13",
+    "gpt-5.4-2026-03-05",
+    "gpt-5.6-luna-2026-07-09",
+    // Reasoning
+    "o3-mini",
+    "o4-mini-2025-04-16",
+    // Claude
+    "claude-haiku-4-5-20251001",
     "claude-sonnet-4-6",
-    "claude-opus-4-6",
+    "claude-sonnet-5",
+    "claude-opus-4-6-20260205",
+    "claude-opus-5",
+    // Gemini
+    "gemini-3-flash",
+    "gemini-3.1-pro",
+    "gemini-3.7-flash",
+    // Other
+    "deepseek-v4-pro",
+    "grok-4.6",
+    "moonshotai.kimi-k2.5",
   ];
   return SEED_MODELS.map((id) => convertLlmModel({ deployment_name: id }));
 }
