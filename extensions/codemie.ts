@@ -1145,7 +1145,10 @@ function registerCapabilitiesCommand(pi) {
     handler: async (args, ctx) => {
       const tokens = (args || "").trim().split(/\s+/).filter(Boolean);
       const filter = tokens.find((token) => token in flags);
-      const models = ctx.modelRegistry.getAvailable().filter((m) => m.provider === "codemie" || m.provider === "codemie-cli");
+      // `codemie` and `codemie-cli` expose the same deployments; only their
+      // billing headers differ. Use the canonical provider here so each
+      // deployment appears once (as /codemie-prices already does).
+      const models = ctx.modelRegistry.getAvailable().filter((m) => m.provider === "codemie");
 
       const rows = models
         .map((model) => {
