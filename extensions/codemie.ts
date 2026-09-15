@@ -59,13 +59,14 @@ import { pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { Image, Markdown } from "@earendil-works/pi-tui";
+import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 
 // Convert an absolute path to a clickable Markdown link. The TUI renders
 // `[label](url)` as an OSC 8 hyperlink, so the saved file opens in one click.
 function fileLink(p, label = p) {
   return `[${label}](${pathToFileURL(String(p)).href})`;
 }
-import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 
 const AUTH_FILE = join(homedir(), ".pi", "agent", "auth.json");
 const COOKIE_FILE = join(homedir(), ".pi", "agent", "codemie-cookie.txt");
