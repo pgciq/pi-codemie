@@ -36,6 +36,7 @@ pi install /path/to/pi-codemie
 | `CODEMIE_JWT_TOKEN` | JWT bearer token (CI mode). |
 | `CODEMIE_API_KEY` | API key bearer token (CI mode). |
 | `CODEMIE_COOKIE` | Raw session cookie (CI mode). |
+| `CODEMIE_SSO_REFRESH_URL` | Optional OAuth refresh endpoint for CodeMie deployments that expose one. The extension sends a standard refresh-token request when a refresh token is available, or a cookie-authenticated request for cookie-based endpoints; otherwise it validates the `_oauth2_proxy` cookie. |
 | `CODEMIE_MODEL` | Static fallback model ID when live model discovery fails. |
 | `CODEMIE_FORCE_NO_PROJECT` | **Debug only.** Set to `1` to make `codemie-cli` omit the `X-CodeMie-Project` header, reproducing the "missing `X-CodeMie-Project`" request shape on demand (no failed `/v1/user` lookup needed). Note the billing outcome is backend/time-dependent (see below); off by default. |
 
@@ -220,7 +221,7 @@ to accept the default (`https://codemie.lab.epam.com`) or type another URL:
 pi --model codemie/gpt-5.1-codex "hello"
 ```
 
-Credentials persist in `~/.pi/agent/auth.json`. Expired sessions are refreshed automatically.
+Credentials persist in `~/.pi/agent/auth.json`. The `codemie` and `codemie-cli` entries are one shared session; if pi writes them at different times, the extension selects the entry with the latest `expires` value and synchronizes both entries again. Cookie-backed SSO sessions are validated independently of any JWT expiry, so a stale JWT does not cause an unnecessary browser login. If the cookie itself is invalid and no usable refresh endpoint can recover it, the browser SSO flow is required.
 
 ## Model discovery (non-blocking)
 

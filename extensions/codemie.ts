@@ -74,6 +74,14 @@ const COOKIE_FILE = join(homedir(), ".pi", "agent", "codemie-cookie.txt");
 // "Billing channel" note above) — kept in sync in ~/.pi/agent/auth.json.
 const PROVIDER_IDS = ["codemie", "codemie-cli"];
 const LOGIN_TIMEOUT_MS = 120_000;
+// OAuth SSO returns an oauth2-proxy session cookie, not a refreshable access
+// token. Re-check that cookie periodically instead of treating the JWT (when
+// present) as the authoritative credential lifetime.
+const COOKIE_SESSION_RECHECK_MS = 15 * 60 * 1000;
+// Optional standard OAuth refresh support. CodeMie's current oauth2-proxy flow
+// normally does not return a refresh token, but keep this configurable for
+// instances that expose a token endpoint.
+const CODEMIE_SSO_REFRESH_URL_ENV = "CODEMIE_SSO_REFRESH_URL";
 // Default CodeMie instance — override with CODEMIE_BASE_URL.
 const DEFAULT_CODEMIE_URL = "https://codemie.lab.epam.com";
 // Bound every CodeMie discovery/lookup request so a slow or hung endpoint can
@@ -396,27 +404,114 @@ async function resolveApiUrl(codeMieUrl, cookieString) {
   return apiBase;
 }
 
-/** Full interactive SSO login → pi OAuthCredentials-shaped object. */
-async function performLogin(codeMieUrl, onAuth) {
-  const { cookies } = await waitForSsoCallback(codeMieUrl, onAuth);
-  const cookieString = Object.entries(cookies)
+/** Parse the state carried in pi's OAuth `refresh` field. */
+function credentialState(credential) {
+  try {
+    const state = JSON.parse(credential?.refresh ?? "{}");
+    return state && typeof state === "object" ? state : {};
+  } catch {
+    return {};
+  }
+}
+
+function cookieStringFromCookies(cookies) {
+  return Object.entries(cookies ?? {})
+    .filter(([, value]) => value != null)
     .map(([key, value]) => `${key}=${value}`)
     .join(";");
-  const access =
-    cookies.codemie_access_token ?? cookieString;
-  const expires =
-    typeof cookies.codemie_access_token === "string"
-      ? decodeJwtExp(cookies.codemie_access_token) ?? Date.now() + 24 * 60 * 60 * 1000
-      : Date.now() + 24 * 60 * 60 * 1000;
-  const apiUrl = await resolveApiUrl(codeMieUrl, cookieString);
+}
+
+function cookieStringFromCredential(credential) {
+  return cookieStringFromCookies(credentialState(credential).cookies);
+}
+
+function hasSessionCookie(credential) {
+  const cookies = credentialState(credential).cookies ?? {};
+  return typeof cookies._oauth2_proxy === "string";
+}
+
+function jwtExpiryFromCredential(credential) {
+  const state = credentialState(credential);
+  const cookieJwt = state.cookies?.codemie_access_token;
+  return typeof cookieJwt === "string"
+    ? decodeJwtExp(cookieJwt)
+    : decodeJwtExp(credential?.access ?? "");
+}
+
+function isAccessTokenExpired(credential) {
+  const expires = jwtExpiryFromCredential(credential);
+  return typeof expires === "number" && Date.now() >= expires - 5 * 60 * 1000;
+}
+
+/**
+ * Create one canonical credential object for both providers. A cookie is the
+ * real gateway credential, so a JWT expiry must not force a browser login while
+ * the cookie still passes an authenticated request.
+ */
+function createOAuthCredential({ cookies, apiUrl, access, expires, state = {} }) {
+  const nextCookies = { ...(cookies ?? {}) };
+  const nextState = { ...state, cookies: nextCookies, apiUrl };
+  const cookieString = cookieStringFromCookies(nextCookies);
+  const nextAccess = access ?? nextCookies.codemie_access_token ?? cookieString;
+  const hasCookie = typeof nextCookies._oauth2_proxy === "string";
+  const jwtExpires = typeof nextCookies.codemie_access_token === "string"
+    ? decodeJwtExp(nextCookies.codemie_access_token)
+    : decodeJwtExp(nextAccess ?? "");
+  const explicitExpires = typeof expires === "number" && Number.isFinite(expires)
+    ? expires
+    : undefined;
+  const nextExpires = hasCookie
+    ? Math.min(
+        explicitExpires && explicitExpires > Date.now()
+          ? explicitExpires
+          : Date.now() + COOKIE_SESSION_RECHECK_MS,
+        Date.now() + COOKIE_SESSION_RECHECK_MS
+      )
+    : explicitExpires ?? jwtExpires ?? Date.now() + 24 * 60 * 60 * 1000;
 
   return {
-    // `refresh` carries everything needed to rebuild the session later.
-    refresh: JSON.stringify({ cookies, apiUrl }),
-    access,
-    expires,
+    refresh: JSON.stringify(nextState),
+    access: nextAccess,
+    expires: nextExpires,
     apiUrl,
   };
+}
+
+/** Choose the freshest copy when pi has persisted the two provider ids apart. */
+function pickLatestOauth(...credentials) {
+  return credentials
+    .flat()
+    .filter((credential) => credential?.access && credential?.refresh)
+    .sort((a, b) => {
+      const expiresA = typeof a.expires === "number" ? a.expires : 0;
+      const expiresB = typeof b.expires === "number" ? b.expires : 0;
+      return expiresB - expiresA;
+    })[0];
+}
+
+/** Full interactive SSO login → pi OAuthCredentials-shaped object. */
+async function performLogin(codeMieUrl, onAuth) {
+  const token = await waitForSsoCallback(codeMieUrl, onAuth);
+  const cookies = token.cookies ?? {};
+  const cookieString = cookieStringFromCookies(cookies);
+  const apiUrl = await resolveApiUrl(codeMieUrl, cookieString);
+  const tokenSet = token.tokens && typeof token.tokens === "object" ? token.tokens : token;
+  const refreshToken = tokenSet.refresh_token ?? tokenSet.refreshToken;
+  const refreshEndpoint =
+    tokenSet.refresh_endpoint ?? tokenSet.refreshEndpoint ?? tokenSet.token_endpoint ?? tokenSet.tokenEndpoint;
+  const state = {
+    ...(refreshToken ? { refreshToken } : {}),
+    ...(refreshEndpoint ? { refreshEndpoint } : {}),
+  };
+  return createOAuthCredential({
+    cookies,
+    apiUrl,
+    access: tokenSet.access_token ?? tokenSet.accessToken ?? cookies.codemie_access_token,
+    expires: typeof tokenSet.expires_in === "number"
+      ? Date.now() + tokenSet.expires_in * 1000
+      : undefined,
+    state,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -427,20 +522,20 @@ function readStoredOauth() {
   try {
     if (!existsSync(AUTH_FILE)) return undefined;
     const parsed = JSON.parse(readFileSync(AUTH_FILE, "utf8"));
-    for (const id of PROVIDER_IDS) {
+    const candidates = PROVIDER_IDS.map((id) => {
       const cred = parsed[id];
-      if (cred?.type === "oauth" && cred.access) {
-        let apiUrl = undefined;
-        try {
-          apiUrl = JSON.parse(cred.refresh ?? "{}")?.apiUrl;
-        } catch {}
-        return { ...cred, apiUrl };
-      }
-    }
+      if (cred?.type !== "oauth" || !cred.access) return undefined;
+      let apiUrl;
+      try {
+        apiUrl = JSON.parse(cred.refresh ?? "{}").apiUrl;
+      } catch {}
+      return { ...cred, apiUrl };
+    });
+    return pickLatestOauth(candidates);
   } catch {
     // Corrupted/unreadable auth file — treat as no stored credentials.
+    return undefined;
   }
-  return undefined;
 }
 
 function writeStoredOauth(credential) {
@@ -448,14 +543,16 @@ function writeStoredOauth(credential) {
     const existing = existsSync(AUTH_FILE)
       ? JSON.parse(readFileSync(AUTH_FILE, "utf8"))
       : {};
-    for (const id of PROVIDER_IDS) {
-      existing[id] = {
-        type: "oauth",
-        refresh: credential.refresh,
-        access: credential.access,
-        expires: credential.expires,
-      };
-    }
+    const shared = {
+      type: "oauth",
+      refresh: credential.refresh,
+      access: credential.access,
+      expires: credential.expires,
+    };
+    // These providers deliberately use one account/session. Always write the
+    // exact same record to both ids; startup also selects the newest record to
+    // recover from pi writing one provider independently.
+    for (const id of PROVIDER_IDS) existing[id] = { ...shared };
     writeFileSync(AUTH_FILE, JSON.stringify(existing, null, 2), { mode: 0o600 });
     chmodSync(AUTH_FILE, 0o600);
   } catch (error) {
@@ -467,19 +564,161 @@ function writeStoredOauth(credential) {
   }
 }
 
-function isExpired(credential) {
-  // Refresh 5 minutes early to avoid mid-session failures.
-  return !credential?.expires || Date.now() >= credential.expires - 5 * 60 * 1000;
+/**
+ * Cookie-backed credentials use `expires` only as a probe deadline; a JWT
+ * expiry alone must not trigger interactive login. Without a cookie, the
+ * access-token expiry is authoritative.
+ */
+function isRefreshDue(credential) {
+  if (hasSessionCookie(credential)) {
+    return !credential?.expires || Date.now() >= credential.expires - 5 * 60 * 1000;
+  }
+  return !credential?.expires || isAccessTokenExpired(credential) || Date.now() >= credential.expires - 5 * 60 * 1000;
 }
 
-function cookieStringFromCredential(credential) {
+function abortIfNeeded(signal) {
+  if (signal?.aborted) {
+    throw signal.reason ?? new Error("CodeMie authentication refresh aborted");
+  }
+}
+
+function setCookiesFromResponse(response) {
+  const headers = response.headers;
+  // getSetCookie() is available in Node's fetch implementation but is not
+  // present in every Headers type pi may compile against.
+  const getSetCookie = (headers as any).getSetCookie;
+  const values = typeof getSetCookie === "function"
+    ? getSetCookie.call(headers)
+    : [headers.get("set-cookie")].filter(Boolean);
+  const cookies = {};
+  for (const value of values) {
+    // Only auth cookies belong in the credential payload. Cookie attributes
+    // (Path, Secure, Max-Age, ...) are deliberately not sent back as cookies.
+    const match = /(?:^|,\s*)(_oauth2_proxy|codemie_access_token)=([^;,]*)/.exec(value);
+    if (match) cookies[match[1]] = match[2];
+  }
+  return cookies;
+}
+
+function credentialWithResponseCookies(credential, response) {
+  const responseCookies = setCookiesFromResponse(response);
+  if (Object.keys(responseCookies).length === 0) return credential;
+  const state = credentialState(credential);
+  return createOAuthCredential({
+    cookies: { ...(state.cookies ?? {}), ...responseCookies },
+    apiUrl: state.apiUrl ?? credential.apiUrl,
+    access: credential.access,
+    state,
+  });
+}
+
+/**
+ * Check the actual gateway cookie independently of the JWT expiry. A 401/302
+ * means the browser session is gone; a network/5xx result is inconclusive and
+ * must not force an unnecessary browser login.
+ */
+async function probeCookieSession(apiUrl, credential, signal) {
+  const cookieString = cookieStringFromCredential(credential);
+  if (!cookieString || !hasSessionCookie(credential)) return { status: "missing" };
   try {
-    const cookies = JSON.parse(credential.refresh ?? "{}")?.cookies ?? {};
-    return Object.entries(cookies)
-      .map(([k, v]) => `${k}=${v}`)
-      .join(";");
-  } catch {
-    return "";
+    abortIfNeeded(signal);
+    const response = await fetch(`${apiUrl.replace(/\/+$/, "")}/v1/user`, {
+      headers: { Cookie: cookieString },
+      redirect: "manual",
+      signal: withTimeout(signal, CODIEME_FETCH_TIMEOUT_MS),
+    });
+    const updated = credentialWithResponseCookies(credential, response);
+    if (response.ok) return { status: "valid", credential: updated };
+    if (response.status === 401 || response.status === 403 || (response.status >= 300 && response.status < 400)) {
+      return { status: "invalid", credential: updated };
+    }
+    return { status: "unknown", credential: updated };
+  } catch (error) {
+    abortIfNeeded(signal);
+    return { status: "unknown", credential };
+  }
+}
+
+function refreshInfoFromCredential(credential) {
+  const state = credentialState(credential);
+  const refreshToken = state.refreshToken ?? state.refresh_token;
+  const endpoint =
+    process.env[CODEMIE_SSO_REFRESH_URL_ENV] ??
+    state.refreshEndpoint ??
+    state.refresh_endpoint ??
+    state.tokenEndpoint ??
+    state.token_endpoint;
+  return { state, refreshToken, endpoint };
+}
+
+/**
+ * Use a real OAuth refresh-token endpoint when one was supplied by the SSO
+ * callback or explicitly configured. The current CodeMie oauth2-proxy flow
+ * generally supplies neither, in which case this returns undefined and the
+ * cookie probe below decides whether a browser login is actually needed.
+ */
+async function refreshWithEndpoint(baseUrl, credential, signal) {
+  const { state, refreshToken, endpoint } = refreshInfoFromCredential(credential);
+  if (!endpoint) return undefined;
+  const refreshUrl = new URL(endpoint, `${baseUrl.replace(/\/+$/, "")}/`).href;
+  try {
+    abortIfNeeded(signal);
+    const response = await fetch(refreshUrl, {
+      method: "POST",
+      headers: {
+        ...(refreshToken ? { "Content-Type": "application/x-www-form-urlencoded" } : {}),
+        ...(cookieStringFromCredential(credential)
+          ? { Cookie: cookieStringFromCredential(credential) }
+          : {}),
+      },
+      ...(refreshToken
+        ? {
+            body: new URLSearchParams({
+              grant_type: "refresh_token",
+              refresh_token: refreshToken,
+            }),
+          }
+        : {}),
+      redirect: "manual",
+      signal: withTimeout(signal, CODIEME_FETCH_TIMEOUT_MS),
+    });
+    if (!response.ok) return undefined;
+
+    let payload = {};
+    try {
+      payload = await response.json();
+    } catch {
+      // Some gateways rotate only the session cookie and return an empty body.
+    }
+    const tokenSet = payload.tokens && typeof payload.tokens === "object"
+      ? payload.tokens
+      : payload;
+    const responseCookies = setCookiesFromResponse(response);
+    const cookies = { ...(state.cookies ?? {}), ...responseCookies, ...(tokenSet.cookies ?? {}) };
+    const nextRefreshToken = tokenSet.refresh_token ?? tokenSet.refreshToken ?? refreshToken;
+    const nextEndpoint =
+      tokenSet.refresh_endpoint ?? tokenSet.refreshEndpoint ?? tokenSet.token_endpoint ?? endpoint;
+    const nextState = {
+      ...state,
+      ...(nextRefreshToken ? { refreshToken: nextRefreshToken } : {}),
+      ...(nextEndpoint ? { refreshEndpoint: nextEndpoint } : {}),
+    };
+    const access = tokenSet.access_token ?? tokenSet.accessToken ?? cookies.codemie_access_token ?? credential.access;
+    const expires = typeof tokenSet.expires_in === "number"
+      ? Date.now() + tokenSet.expires_in * 1000
+      : typeof tokenSet.expires_at === "number"
+        ? tokenSet.expires_at
+        : undefined;
+    return createOAuthCredential({
+      cookies,
+      apiUrl: state.apiUrl ?? credential.apiUrl,
+      access,
+      expires,
+      state: nextState,
+    });
+  } catch (error) {
+    abortIfNeeded(signal);
+    return undefined;
   }
 }
 
@@ -639,9 +878,13 @@ export default function (pi) {
       : { apiKey: jwt || apiKeyEnv };
   }
 
-  // ---- Mode 2: OAuth SSO (login/refresh only run on /login) --------------
+  // ---- Mode 2: OAuth SSO (login is lazy; refresh is cookie-aware) ---------
   let oauthBlock = null;
+  // Both provider registrations point at this same in-memory credential. The
+  // promise also prevents codemie and codemie-cli from opening two browsers
+  // when they notice expiry at the same time.
   let oauthCreds = null;
+  let oauthRefreshPromise = null;
   let activeBaseUrl = codeMieUrl;
 
   if (!envAuth) {
@@ -674,14 +917,75 @@ export default function (pi) {
           oauthCreds = cred;
           return { refresh: cred.refresh, access: cred.access, expires: cred.expires };
         },
-        async refreshToken(credentials) {
-          if (!isExpired(credentials)) return credentials;
-          console.error("[codemie] SSO session expired — reopening browser for login...");
-          const cred = await performLogin(activeBaseUrl);
-          persistSession(cred);
-          apiUrl = cred.apiUrl;
-          oauthCreds = cred;
-          return { refresh: cred.refresh, access: cred.access, expires: cred.expires };
+        async refreshToken(credentials, signal) {
+          abortIfNeeded(signal);
+          // pi can invoke this with the stale record belonging to one
+          // provider. Prefer the freshest shared copy from memory/disk.
+          const current = pickLatestOauth(oauthCreds, credentials, readStoredOauth()) ?? credentials;
+          if (!isRefreshDue(current)) {
+            oauthCreds = current;
+            persistSession(current);
+            return current;
+          }
+
+          if (oauthRefreshPromise) return oauthRefreshPromise;
+          oauthRefreshPromise = (async () => {
+            const latest = pickLatestOauth(oauthCreds, current, readStoredOauth()) ?? current;
+            if (!isRefreshDue(latest)) {
+              oauthCreds = latest;
+              persistSession(latest);
+              return latest;
+            }
+
+            // First use a real refresh-token endpoint, when CodeMie (or a
+            // configured deployment) supplied one. This is silent and does
+            // not involve the browser.
+            const refreshed = await refreshWithEndpoint(activeBaseUrl, latest, signal);
+            if (refreshed) {
+              persistSession(refreshed);
+              apiUrl = refreshed.apiUrl ?? apiUrl;
+              oauthCreds = refreshed;
+              return refreshed;
+            }
+
+            if (hasSessionCookie(latest)) {
+              if (isAccessTokenExpired(latest)) {
+                console.error("[codemie] JWT expired; checking the SSO cookie before asking for login...");
+              }
+              const probe = await probeCookieSession(latest.apiUrl ?? apiUrl, latest, signal);
+              if (probe.status === "valid" || probe.status === "unknown") {
+                // A valid cookie is the real auth state. If the probe was
+                // inconclusive (network/5xx), keep working and retry the
+                // probe later rather than opening a needless browser.
+                const checked = probe.credential ?? latest;
+                const state = credentialState(checked);
+                const extended = createOAuthCredential({
+                  cookies: state.cookies ?? {},
+                  apiUrl: state.apiUrl ?? checked.apiUrl ?? apiUrl,
+                  access: checked.access,
+                  state,
+                });
+                persistSession(extended);
+                apiUrl = extended.apiUrl ?? apiUrl;
+                oauthCreds = extended;
+                return extended;
+              }
+              // 401/403/302 means the cookie itself is invalid, regardless
+              // of whether its JWT-shaped companion has expired.
+              console.error("[codemie] SSO cookie is no longer valid — opening browser login...");
+            }
+
+            const cred = await performLogin(activeBaseUrl);
+            persistSession(cred);
+            apiUrl = cred.apiUrl;
+            oauthCreds = cred;
+            return cred;
+          })();
+          try {
+            return await oauthRefreshPromise;
+          } finally {
+            oauthRefreshPromise = null;
+          }
         },
         getApiKey(credentials) { return credentials.access; },
       };
